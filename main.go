@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/ChronixDB/chronix.go/chronix"
-	"github.com/ChronixDB/chronix.ingestor/ingester"
+	"github.com/ChronixDB/chronix.ingester/ingester"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

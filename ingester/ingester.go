@@ -145,10 +145,7 @@ func (i *Ingester) Append(sample *model.Sample) error {
 		return fmt.Errorf("ingester stopping")
 	}
 
-	fp, series, err := i.getOrCreateSeries(sample.Metric)
-	if err != nil {
-		return err
-	}
+	fp, series := i.getOrCreateSeries(sample.Metric)
 	defer func() {
 		i.fpLocker.Unlock(fp)
 	}()
@@ -171,7 +168,7 @@ func (i *Ingester) Append(sample *model.Sample) error {
 		return ErrOutOfOrderSample // Caused by the caller.
 	}
 	prevNumChunks := len(series.chunkDescs)
-	_, err = series.add(model.SamplePair{
+	_, err := series.add(model.SamplePair{
 		Value:     sample.Value,
 		Timestamp: sample.Timestamp,
 	})
@@ -184,7 +181,7 @@ func (i *Ingester) Append(sample *model.Sample) error {
 	return err
 }
 
-func (i *Ingester) getOrCreateSeries(metric model.Metric) (model.Fingerprint, *memorySeries, error) {
+func (i *Ingester) getOrCreateSeries(metric model.Metric) (model.Fingerprint, *memorySeries) {
 	rawFP := metric.FastFingerprint()
 	i.fpLocker.Lock(rawFP)
 	fp := i.mapper.mapFP(rawFP, metric)
@@ -195,17 +192,12 @@ func (i *Ingester) getOrCreateSeries(metric model.Metric) (model.Fingerprint, *m
 
 	series, ok := i.fpToSeries.get(fp)
 	if ok {
-		return fp, series, nil
+		return fp, series
 	}
 
-	var err error
-	series, err = newMemorySeries(metric, nil, time.Time{})
-	if err != nil {
-		// err should always be nil when chunkDescs are nil
-		panic(err)
-	}
+	series = newMemorySeries(metric)
 	i.fpToSeries.put(fp, series)
-	return fp, series, nil
+	return fp, series
 }
 
 // Stop stops the Ingester.
@@ -259,8 +251,6 @@ func (i *Ingester) flushSeries(fp model.Fingerprint, series *memorySeries, immed
 	// Decide what chunks to flush.
 	if immediate || time.Now().Sub(series.firstTime().Time()) > i.cfg.MaxChunkAge {
 		series.headChunkClosed = true
-		series.headChunkUsedByIterator = false
-		series.head().MaybePopulateLastTime()
 	}
 	chunks := series.chunkDescs
 	if !series.headChunkClosed {
