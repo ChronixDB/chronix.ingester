@@ -266,6 +266,9 @@ func (i *Ingester) flushSeries(fp model.Fingerprint, series *memorySeries, immed
 		i.chunkStoreFailures.Add(float64(len(chunks)))
 		return err
 	}
+	for _, c := range chunks {
+		i.chunkUtilization.Observe(c.C.Utilization())
+	}
 
 	// Now remove the chunks.
 	i.fpLocker.Lock(fp)
