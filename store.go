@@ -42,7 +42,7 @@ func transcodeChunk(metric model.Metric, desc *chunk.Desc) (*chronix.TimeSeries,
 		sp := it.Value()
 		ts.Points = append(ts.Points, chronix.Point{
 			Value:     float64(sp.Value),
-			Timestamp: sp.Timestamp.Unix(),
+			Timestamp: sp.Timestamp.UnixNano() / 1e6,
 		})
 	}
 	if it.Err() != nil {
