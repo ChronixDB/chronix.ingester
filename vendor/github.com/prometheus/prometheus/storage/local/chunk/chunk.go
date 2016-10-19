@@ -252,6 +252,8 @@ func (d *Desc) MaybeEvict() bool {
 		panic("ChunkLastTime not populated for evicted chunk")
 	}
 	d.C = nil
+	Ops.WithLabelValues(Evict).Inc()
+	atomic.AddInt64(&NumMemChunks, -1)
 	return true
 }
 
@@ -273,6 +275,7 @@ type Chunk interface {
 	Unmarshal(io.Reader) error
 	UnmarshalFromBuf([]byte) error
 	Encoding() Encoding
+	Utilization() float64
 }
 
 // Iterator enables efficient access to the content of a chunk. It is

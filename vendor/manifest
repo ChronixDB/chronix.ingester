@@ -200,7 +200,7 @@
 			"importpath": "github.com/prometheus/prometheus/storage",
 			"repository": "https://github.com/prometheus/prometheus",
 			"vcs": "git",
-			"revision": "0dbcf55bd27284afbc474da20ba8e942185430eb",
+			"revision": "3c8140f2e6e3b84b58e5787a4e7a6250c01e2177",
 			"branch": "master",
 			"path": "/storage",
 			"notests": true
