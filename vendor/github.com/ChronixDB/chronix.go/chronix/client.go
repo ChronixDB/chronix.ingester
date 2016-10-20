@@ -34,7 +34,7 @@ func (c *client) Store(series []*TimeSeries, commit bool) error {
 			continue
 		}
 
-		data, err := encode(ts.Points)
+		data, err := encode(ts.Points, 0)
 		if err != nil {
 			return fmt.Errorf("error encoding points: %v", err)
 		}
