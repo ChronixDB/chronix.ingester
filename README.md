@@ -47,3 +47,14 @@ To run tests:
 ```
 go test ./...
 ```
+
+## Configuring Prometheus
+
+Sending samples to the Chronix ingester from Prometheus requires Prometheus
+version 1.2.0 or newer. To configure Prometheus to send samples to the
+ingester, add the following stanza to your Prometheus configuration file:
+
+```yml
+remote_write:
+  url: http://<host>:<port>/ingest
+```
