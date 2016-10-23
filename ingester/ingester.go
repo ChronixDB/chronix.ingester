@@ -113,7 +113,7 @@ func NewIngester(cfg Config, chunkStore ChunkStore) *Ingester {
 		}),
 		memoryChunks: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "chronix_ingester_memory_chunks",
-			Help: "The total number of samples returned from queries.",
+			Help: "The total number of chunks in memory.",
 		}),
 		chunkStoreFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "chronix_ingester_chunk_store_failures_total",
@@ -288,6 +288,7 @@ func (i *Ingester) Describe(ch chan<- *prometheus.Desc) {
 	i.discardedSamples.Describe(ch)
 	ch <- i.chunkUtilization.Desc()
 	ch <- i.chunkStoreFailures.Desc()
+	ch <- i.memoryChunks.Desc()
 }
 
 // Collect implements prometheus.Collector.
@@ -301,4 +302,5 @@ func (i *Ingester) Collect(ch chan<- prometheus.Metric) {
 	i.discardedSamples.Collect(ch)
 	ch <- i.chunkUtilization
 	ch <- i.chunkStoreFailures
+	ch <- i.memoryChunks
 }
