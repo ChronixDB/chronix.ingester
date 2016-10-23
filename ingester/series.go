@@ -168,13 +168,3 @@ func (s *memorySeries) add(v model.SamplePair) (int, error) {
 func (s *memorySeries) head() *chunk.Desc {
 	return s.chunkDescs[len(s.chunkDescs)-1]
 }
-
-// firstTime returns the timestamp of the first sample in the series.
-//
-// The caller must have locked the fingerprint of the memorySeries.
-func (s *memorySeries) firstTime() model.Time {
-	if len(s.chunkDescs) > 0 {
-		return s.chunkDescs[0].FirstTime()
-	}
-	return model.Earliest
-}

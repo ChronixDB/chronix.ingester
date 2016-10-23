@@ -249,7 +249,7 @@ func (i *Ingester) flushSeries(fp model.Fingerprint, series *memorySeries, immed
 	i.fpLocker.Lock(fp)
 
 	// Decide what chunks to flush.
-	if immediate || time.Now().Sub(series.firstTime().Time()) > i.cfg.MaxChunkAge {
+	if immediate || time.Now().Sub(series.head().FirstTime().Time()) > i.cfg.MaxChunkAge {
 		series.headChunkClosed = true
 	}
 	chunks := series.chunkDescs
