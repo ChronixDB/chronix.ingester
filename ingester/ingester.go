@@ -272,7 +272,7 @@ func (i *Ingester) flushSeries(fp model.Fingerprint, series *memorySeries, immed
 
 	// Now remove the chunks.
 	i.fpLocker.Lock(fp)
-	series.chunkDescs = series.chunkDescs[len(chunks)-1:]
+	series.chunkDescs = series.chunkDescs[len(chunks):]
 	i.memoryChunks.Sub(float64(len(chunks)))
 	if len(series.chunkDescs) == 0 {
 		i.fpToSeries.del(fp)
