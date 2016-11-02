@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/ChronixDB/chronix.go/chronix"
 	"github.com/prometheus/common/model"
@@ -9,7 +10,8 @@ import (
 )
 
 type chronixStore struct {
-	chronix chronix.Client
+	chronix      chronix.Client
+	commitWithin time.Duration
 }
 
 func (s *chronixStore) Put(metric model.Metric, descs []*chunk.Desc) error {
@@ -18,7 +20,7 @@ func (s *chronixStore) Put(metric model.Metric, descs []*chunk.Desc) error {
 		if err != nil {
 			return fmt.Errorf("error transcoding chunk: %v", err)
 		}
-		if err := s.chronix.Store([]*chronix.TimeSeries{ts}, false); err != nil {
+		if err := s.chronix.Store([]*chronix.TimeSeries{ts}, false, s.commitWithin); err != nil {
 			return fmt.Errorf("error storing chunk: %v", err)
 		}
 	}
