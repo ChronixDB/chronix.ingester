@@ -14,9 +14,10 @@ import (
 
 func main() {
 	var (
-		listenAddr  = flag.String("listen-addr", ":8080", "The address to listen on.")
-		chronixURL  = flag.String("chronix-url", "http://localhost:8983/solr/chronix", "The URL of the Chronix endpoint.")
-		maxChunkAge = flag.Duration("max-chunk-age", time.Hour, "The maximum age of a chunk before it is closed and persisted.")
+		listenAddr   = flag.String("listen-addr", ":8080", "The address to listen on.")
+		chronixURL   = flag.String("chronix-url", "http://localhost:8983/solr/chronix", "The URL of the Chronix endpoint.")
+		commitWithin = flag.Duration("chronix-commit-within", 5*time.Second, "The duration after which updates to Chronix should be committed.")
+		maxChunkAge  = flag.Duration("max-chunk-age", time.Hour, "The maximum age of a chunk before it is closed and persisted.")
 	)
 	flag.Parse()
 
@@ -30,7 +31,10 @@ func main() {
 		ingester.Config{
 			MaxChunkAge: *maxChunkAge,
 		},
-		&chronixStore{chronix: chronix},
+		&chronixStore{
+			chronix:      chronix,
+			commitWithin: *commitWithin,
+		},
 	)
 	defer ing.Stop()
 	prometheus.Register(ing)

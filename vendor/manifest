@@ -5,7 +5,7 @@
 			"importpath": "github.com/ChronixDB/chronix.go/chronix",
 			"repository": "https://github.com/ChronixDB/chronix.go",
 			"vcs": "git",
-			"revision": "10dfc5b79b1190e2e401898c19a557af8fcd589b",
+			"revision": "c15f1c65dc3f0904cbb1e172e294daa7c6a1cfb8",
 			"branch": "master",
 			"path": "/chronix",
 			"notests": true

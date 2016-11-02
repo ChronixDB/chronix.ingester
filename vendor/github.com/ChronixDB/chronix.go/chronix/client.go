@@ -3,11 +3,12 @@ package chronix
 import (
 	"encoding/base64"
 	"fmt"
+	"time"
 )
 
 // Client is a client that allows storing time series in Chronix.
 type Client interface {
-	Store(ts []*TimeSeries, commit bool) error
+	Store(ts []*TimeSeries, commit bool, commitWithin time.Duration) error
 	// TODO: Return a more interpreted query result on the Chronix level.
 	Query(q, fq, fl string) ([]byte, error)
 }
@@ -23,7 +24,7 @@ func New(s SolrClient) Client {
 	}
 }
 
-func (c *client) Store(series []*TimeSeries, commit bool) error {
+func (c *client) Store(series []*TimeSeries, commit bool, commitWithin time.Duration) error {
 	if len(series) == 0 {
 		return nil
 	}
@@ -52,7 +53,7 @@ func (c *client) Store(series []*TimeSeries, commit bool) error {
 
 		update = append(update, fields)
 	}
-	return c.solr.Update(update, commit)
+	return c.solr.Update(update, commit, commitWithin)
 }
 
 func (c *client) Query(q, fq, fl string) ([]byte, error) {

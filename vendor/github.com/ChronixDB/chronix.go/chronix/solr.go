@@ -14,7 +14,7 @@ import (
 
 // A SolrClient allows updating documents in Solr.
 type SolrClient interface {
-	Update(data []map[string]interface{}, commit bool) error
+	Update(data []map[string]interface{}, commit bool, commitWithin time.Duration) error
 	// TODO: Return a more interpreted result on the Solr level.
 	Query(q, fq, fl string) ([]byte, error)
 }
@@ -55,14 +55,17 @@ func NewSolrClient(url *url.URL, transport CancelableTransport) SolrClient {
 }
 
 // Update implements SolrClient.
-func (c *solrClient) Update(data []map[string]interface{}, commit bool) error {
+func (c *solrClient) Update(data []map[string]interface{}, commit bool, commitWithin time.Duration) error {
 	u := *c.url
 	u.Path = path.Join(c.url.Path, "/update")
+	qs := u.Query()
 	if commit {
-		qs := u.Query()
 		qs.Set("commit", "true")
-		u.RawQuery = qs.Encode()
 	}
+	if commitWithin != 0 {
+		qs.Set("commitWithin", fmt.Sprintf("%d", commitWithin.Nanoseconds()/1e6))
+	}
+	u.RawQuery = qs.Encode()
 
 	buf, err := json.Marshal(data)
 	if err != nil {
