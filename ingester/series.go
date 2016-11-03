@@ -151,11 +151,6 @@ func (s *memorySeries) add(v model.SamplePair) (int, error) {
 		s.chunkDescs = append(s.chunkDescs, chunk.NewDesc(c, c.FirstTime()))
 	}
 
-	// Populate lastTime of now-closed chunks.
-	for _, cd := range s.chunkDescs[len(s.chunkDescs)-len(chunks) : len(s.chunkDescs)-1] {
-		cd.MaybePopulateLastTime()
-	}
-
 	s.lastTime = v.Timestamp
 	s.lastSampleValue = v.Value
 	s.lastSampleValueSet = true
