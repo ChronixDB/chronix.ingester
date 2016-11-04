@@ -28,8 +28,16 @@ To show all flags:
 ```
 ./chronix.ingester -h
 Usage of ./chronix.ingester:
+  -checkpoint-file string
+    	The path to the checkpoint file. (default "checkpoint.db")
+  -checkpoint-interval duration
+    	The interval between checkpoints. (default 5m0s)
+  -chronix-commit-within duration
+    	The duration after which updates to Chronix should be committed. (default 5s)
   -chronix-url string
     	The URL of the Chronix endpoint. (default "http://localhost:8983/solr/chronix")
+  -flush-on-shutdown
+    	Whether to flush all chunks to Chronix on shutdown, rather than saving them to a checkpoint. A checkpoint will still be written, but will be empty.
   -listen-addr string
     	The address to listen on. (default ":8080")
   -log.format value
