@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"sync"
@@ -13,6 +14,16 @@ import (
 	"github.com/prometheus/common/model"
 )
 
+type erroringChronix struct{}
+
+func (c *erroringChronix) Store(ts []*chronix.TimeSeries, commit bool, commitWithin time.Duration) error {
+	return fmt.Errorf("this is a purposefully erroring Chronix client")
+}
+
+func (c *erroringChronix) Query(q, fq, fl string) ([]byte, error) {
+	panic("not implemented")
+}
+
 // A testChronix instance acts as a chronix.Client that records any series sent
 // to it and can return them as a model.Matrix.
 type testChronix struct {
@@ -20,7 +31,7 @@ type testChronix struct {
 	sampleStreams map[model.Fingerprint]*model.SampleStream
 }
 
-func (c *testChronix) Store(ts []*chronix.TimeSeries, commit bool) error {
+func (c *testChronix) Store(ts []*chronix.TimeSeries, commit bool, commitWithin time.Duration) error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
@@ -103,12 +114,18 @@ func TestEndToEnd(t *testing.T) {
 	chronix := &testChronix{
 		sampleStreams: map[model.Fingerprint]*model.SampleStream{},
 	}
-	ing := ingester.NewIngester(
+	checkpointFile := "test-checkpoint.db"
+	defer os.Remove(checkpointFile)
+	ing, err := ingester.NewIngester(
 		ingester.Config{
-			MaxChunkAge: 9999 * time.Hour,
+			MaxChunkAge:    9999 * time.Hour,
+			CheckpointFile: checkpointFile,
 		},
 		&chronixStore{chronix: chronix},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Create test samples.
 	testData := buildTestMatrix(10, 1000)
@@ -121,7 +138,48 @@ func TestEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Stop the ingester, causing it to flush all chunks to Chronix.
+	// Stop the ingester, causing it to checkpoint its state to disk.
+	ing.Stop()
+
+	// Create a new ingester that recovers from the checkpoint, but tries
+	// to store chunks into a an erroring Chronix client.
+	ing, err = ingester.NewIngester(
+		ingester.Config{
+			MaxChunkAge:     9999 * time.Hour,
+			CheckpointFile:  checkpointFile,
+			FlushOnShutdown: true,
+		},
+		&chronixStore{chronix: &erroringChronix{}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stop the ingester, causing it to try and flush its chunks to Chronix.
+	// But storing chunks in the erroring Chronix client will fail, so it will
+	// still checkpoint all chunks to disk (again).
+	ing.Stop()
+
+	// No samples should have been stored in the working Chronix client yet.
+	if len(chronix.toMatrix()) != 0 {
+		t.Fatal("Unexpected samples were stored in Chronix client:", chronix.toMatrix())
+	}
+
+	// Create a new ingester that recovers from the checkpoint again, but talks
+	// to a working Chronix client this time.
+	ing, err = ingester.NewIngester(
+		ingester.Config{
+			MaxChunkAge:     9999 * time.Hour,
+			CheckpointFile:  checkpointFile,
+			FlushOnShutdown: true,
+		},
+		&chronixStore{chronix: chronix},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stop the ingester, causing it to flush its chunks to Chronix.
 	ing.Stop()
 
 	// Compare stored samples from Chronix with expected samples.

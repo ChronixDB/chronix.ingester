@@ -46,18 +46,22 @@ type Config struct {
 	FlushCheckPeriod     time.Duration
 	MaxChunkAge          time.Duration
 	MaxConcurrentFlushes int
+	CheckpointFile       string
+	CheckpointInterval   time.Duration
+	FlushOnShutdown      bool
 }
 
 // An Ingester batches up samples for multiple series and stores
 // them as chunks in a ChunkStore.
 type Ingester struct {
 	// Configuration and lifecycle management.
-	cfg        Config
-	chunkStore ChunkStore
-	stopLock   sync.RWMutex
-	stopped    bool
-	quit       chan struct{}
-	done       chan struct{}
+	cfg          Config
+	chunkStore   ChunkStore
+	checkpointer *checkpointer
+	stopLock     sync.RWMutex
+	stopped      bool
+	quit         chan struct{}
+	done         chan struct{}
 
 	// Sample ingestion state.
 	fpLocker   *fingerprintLocker
@@ -70,10 +74,11 @@ type Ingester struct {
 	chunkUtilization   prometheus.Histogram
 	chunkStoreFailures prometheus.Counter
 	memoryChunks       prometheus.Gauge
+	checkpointDuration prometheus.Gauge
 }
 
 // NewIngester constructs a new Ingester.
-func NewIngester(cfg Config, chunkStore ChunkStore) *Ingester {
+func NewIngester(cfg Config, chunkStore ChunkStore) (*Ingester, error) {
 	if cfg.FlushCheckPeriod == 0 {
 		cfg.FlushCheckPeriod = 1 * time.Minute
 	}
@@ -84,16 +89,13 @@ func NewIngester(cfg Config, chunkStore ChunkStore) *Ingester {
 		cfg.MaxConcurrentFlushes = 100
 	}
 
-	sm := newSeriesMap()
 	i := &Ingester{
 		cfg:        cfg,
 		chunkStore: chunkStore,
 		quit:       make(chan struct{}),
 		done:       make(chan struct{}),
 
-		fpToSeries: sm,
-		fpLocker:   newFingerprintLocker(16),
-		mapper:     newFPMapper(sm),
+		fpLocker: newFingerprintLocker(16),
 
 		ingestedSamples: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "chronix_ingester_ingested_samples_total",
@@ -119,10 +121,27 @@ func NewIngester(cfg Config, chunkStore ChunkStore) *Ingester {
 			Name: "chronix_ingester_chunk_store_failures_total",
 			Help: "The total number of errors while storing chunks to the chunk store.",
 		}),
+		checkpointDuration: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "chronix_ingester_checkpoint_duration_seconds",
+			Help: "The duration in seconds it took to checkpoint in-memory chunks and metrics.",
+		}),
 	}
 
+	i.checkpointer = newCheckpointer(cfg.CheckpointFile)
+	i.fpToSeries = newSeriesMap()
+	i.mapper = newFPMapper(i.fpToSeries)
+
+	log.Info("Recovering from checkpoint...")
+	numMemoryChunks, err := i.checkpointer.recover(i.fpToSeries, i.mapper)
+	if err != nil {
+		return nil, fmt.Errorf("error loading checkpoint: %v", err)
+	}
+	log.Infof("Recovered %d series with %d chunks from checkpoint.", len(i.fpToSeries.m), numMemoryChunks)
+
+	i.memoryChunks.Set(float64(numMemoryChunks))
+
 	go i.loop()
-	return i
+	return i, nil
 }
 
 // NeedsThrottling implements storage.SampleAppender.
@@ -210,18 +229,36 @@ func (i *Ingester) Stop() {
 	<-i.done
 }
 
+func (i *Ingester) checkpoint() {
+	log.Info("Checkpointing unpersisted state...")
+	begin := time.Now()
+	if err := i.checkpointer.checkpoint(i.fpToSeries, i.fpLocker); err != nil {
+		log.Errorln("Error writing checkpoint:", err)
+	} else {
+		duration := time.Since(begin)
+		i.checkpointDuration.Set(duration.Seconds())
+		log.Infof("Done checkpointing in %v.", duration)
+	}
+}
+
 func (i *Ingester) loop() {
 	defer func() {
-		i.flushAllSeries(true)
+		if i.cfg.FlushOnShutdown {
+			i.flushAllSeries(true)
+		}
+		i.checkpoint()
 		close(i.done)
-		log.Infof("Ingester exited gracefully")
+		log.Infoln("Ingester exited gracefully")
 	}()
 
-	tick := time.Tick(i.cfg.FlushCheckPeriod)
+	flushTick := time.Tick(i.cfg.FlushCheckPeriod)
+	checkpointTick := time.Tick(i.cfg.CheckpointInterval)
 	for {
 		select {
-		case <-tick:
+		case <-flushTick:
 			i.flushAllSeries(false)
+		case <-checkpointTick:
+			i.checkpoint()
 		case <-i.quit:
 			return
 		}
@@ -289,6 +326,7 @@ func (i *Ingester) Describe(ch chan<- *prometheus.Desc) {
 	ch <- i.chunkUtilization.Desc()
 	ch <- i.chunkStoreFailures.Desc()
 	ch <- i.memoryChunks.Desc()
+	ch <- i.checkpointDuration.Desc()
 }
 
 // Collect implements prometheus.Collector.
@@ -303,4 +341,5 @@ func (i *Ingester) Collect(ch chan<- prometheus.Metric) {
 	ch <- i.chunkUtilization
 	ch <- i.chunkStoreFailures
 	ch <- i.memoryChunks
+	ch <- i.checkpointDuration
 }
