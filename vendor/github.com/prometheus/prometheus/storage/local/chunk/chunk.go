@@ -33,7 +33,10 @@ const ChunkLen = 1024
 // DefaultEncoding can be changed via a flag.
 var DefaultEncoding = DoubleDelta
 
-var errChunkBoundsExceeded = errors.New("attempted access outside of chunk boundaries")
+var (
+	errChunkBoundsExceeded = errors.New("attempted access outside of chunk boundaries")
+	errAddedToEvictedChunk = errors.New("attempted to add sample to evicted chunk")
+)
 
 // EvictRequest is a request to evict a chunk from memory.
 type EvictRequest struct {
@@ -133,6 +136,9 @@ func NewDesc(c Chunk, firstTime model.Time) *Desc {
 // The chunk must be pinned, and the caller must have locked the fingerprint of
 // the series.
 func (d *Desc) Add(s model.SamplePair) ([]Chunk, error) {
+	if d.C == nil {
+		return nil, errAddedToEvictedChunk
+	}
 	return d.C.Add(s)
 }
 
@@ -260,7 +266,7 @@ func (d *Desc) MaybeEvict() bool {
 // Chunk is the interface for all chunks. Chunks are generally not
 // goroutine-safe.
 type Chunk interface {
-	// add adds a SamplePair to the chunks, performs any necessary
+	// Add adds a SamplePair to the chunks, performs any necessary
 	// re-encoding, and adds any necessary overflow chunks. It returns the
 	// new version of the original chunk, followed by overflow chunks, if
 	// any. The first chunk returned might be the same as the original one
@@ -276,6 +282,10 @@ type Chunk interface {
 	UnmarshalFromBuf([]byte) error
 	Encoding() Encoding
 	Utilization() float64
+
+	// Len returns the number of samples in the chunk.  Implementations may be
+	// expensive.
+	Len() int
 }
 
 // Iterator enables efficient access to the content of a chunk. It is

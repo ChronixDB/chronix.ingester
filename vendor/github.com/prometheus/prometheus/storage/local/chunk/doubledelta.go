@@ -83,14 +83,14 @@ func newDoubleDeltaEncodedChunk(tb, vb deltaBytes, isInt bool, length int) *doub
 // Add implements chunk.
 func (c doubleDeltaEncodedChunk) Add(s model.SamplePair) ([]Chunk, error) {
 	// TODO(beorn7): Since we return &c, this method might cause an unnecessary allocation.
-	if c.len() == 0 {
+	if c.Len() == 0 {
 		return c.addFirstSample(s), nil
 	}
 
 	tb := c.timeBytes()
 	vb := c.valueBytes()
 
-	if c.len() == 1 {
+	if c.Len() == 1 {
 		return c.addSecondSample(s, tb, vb)
 	}
 
@@ -103,10 +103,10 @@ func (c doubleDeltaEncodedChunk) Add(s model.SamplePair) ([]Chunk, error) {
 		return addToOverflowChunk(&c, s)
 	}
 
-	projectedTime := c.baseTime() + model.Time(c.len())*c.baseTimeDelta()
+	projectedTime := c.baseTime() + model.Time(c.Len())*c.baseTimeDelta()
 	ddt := s.Timestamp - projectedTime
 
-	projectedValue := c.baseValue() + model.SampleValue(c.len())*c.baseValueDelta()
+	projectedValue := c.baseValue() + model.SampleValue(c.Len())*c.baseValueDelta()
 	ddv := s.Value - projectedValue
 
 	ntb, nvb, nInt := tb, vb, c.isInt()
@@ -198,7 +198,7 @@ func (c doubleDeltaEncodedChunk) FirstTime() model.Time {
 
 // NewIterator( implements chunk.
 func (c *doubleDeltaEncodedChunk) NewIterator() Iterator {
-	return newIndexAccessingChunkIterator(c.len(), &doubleDeltaEncodedIndexAccessor{
+	return newIndexAccessingChunkIterator(c.Len(), &doubleDeltaEncodedIndexAccessor{
 		c:      *c,
 		baseT:  c.baseTime(),
 		baseΔT: c.baseTimeDelta(),
@@ -247,28 +247,36 @@ func (c *doubleDeltaEncodedChunk) Unmarshal(r io.Reader) error {
 	if _, err := io.ReadFull(r, *c); err != nil {
 		return err
 	}
-	l := binary.LittleEndian.Uint16((*c)[doubleDeltaHeaderBufLenOffset:])
-	if int(l) > cap(*c) {
-		return fmt.Errorf("chunk length exceeded during unmarshaling: %d", l)
-	}
-	if int(l) < doubleDeltaHeaderMinBytes {
-		return fmt.Errorf("chunk length less than header size: %d < %d", l, doubleDeltaHeaderMinBytes)
-	}
-
-	*c = (*c)[:l]
-	return nil
+	return c.setLen()
 }
 
 // UnmarshalFromBuf implements chunk.
 func (c *doubleDeltaEncodedChunk) UnmarshalFromBuf(buf []byte) error {
 	*c = (*c)[:cap(*c)]
 	copy(*c, buf)
+	return c.setLen()
+}
+
+// setLen sets the length of the underlying slice and performs some sanity checks.
+func (c *doubleDeltaEncodedChunk) setLen() error {
 	l := binary.LittleEndian.Uint16((*c)[doubleDeltaHeaderBufLenOffset:])
 	if int(l) > cap(*c) {
-		return fmt.Errorf("chunk length exceeded during unmarshaling: %d", l)
+		return fmt.Errorf("doubledelta chunk length exceeded during unmarshaling: %d", l)
 	}
 	if int(l) < doubleDeltaHeaderMinBytes {
-		return fmt.Errorf("chunk length less than header size: %d < %d", l, doubleDeltaHeaderMinBytes)
+		return fmt.Errorf("doubledelta chunk length less than header size: %d < %d", l, doubleDeltaHeaderMinBytes)
+	}
+	switch c.timeBytes() {
+	case d1, d2, d4, d8:
+		// Pass.
+	default:
+		return fmt.Errorf("invalid number of time bytes in doubledelta chunk: %d", c.timeBytes())
+	}
+	switch c.valueBytes() {
+	case d0, d1, d2, d4, d8:
+		// Pass.
+	default:
+		return fmt.Errorf("invalid number of value bytes in doubledelta chunk: %d", c.valueBytes())
 	}
 	*c = (*c)[:l]
 	return nil
@@ -279,7 +287,7 @@ func (c doubleDeltaEncodedChunk) Encoding() Encoding { return DoubleDelta }
 
 // Utilization implements chunk.
 func (c doubleDeltaEncodedChunk) Utilization() float64 {
-	return float64(len(c)) / float64(cap(c))
+	return float64(len(c)-doubleDeltaHeaderIsIntOffset-1) / float64(cap(c))
 }
 
 func (c doubleDeltaEncodedChunk) baseTime() model.Time {
@@ -336,7 +344,8 @@ func (c doubleDeltaEncodedChunk) sampleSize() int {
 	return int(c.timeBytes() + c.valueBytes())
 }
 
-func (c doubleDeltaEncodedChunk) len() int {
+// Len implements Chunk. Runs in constant time.
+func (c doubleDeltaEncodedChunk) Len() int {
 	if len(c) <= doubleDeltaHeaderIsIntOffset+1 {
 		return 0
 	}

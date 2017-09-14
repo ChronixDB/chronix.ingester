@@ -18,12 +18,14 @@ import (
 	"container/list"
 	"errors"
 	"fmt"
-	"math"
+	"math/rand"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
@@ -41,8 +43,11 @@ const (
 	fpMaxSweepTime    = 6 * time.Hour
 	fpMaxWaitDuration = 10 * time.Second
 
-	// See waitForNextFP.
-	maxEvictInterval = time.Minute
+	// See handleEvictList. This should be clearly shorter than the usual CG
+	// interval. On the other hand, each evict check calls ReadMemStats,
+	// which involves stopping the world (at least up to Go1.8). Hence,
+	// don't just set this to a very short interval.
+	evictInterval = time.Second
 
 	// Constants to control the hysteresis of entering and leaving "rushed
 	// mode". In rushed mode, the dirty series count is ignored for
@@ -74,19 +79,12 @@ const (
 	// real-life production scenario.
 	fpEqualMatchThreshold = 1000
 	fpOtherMatchThreshold = 10000
-)
 
-var (
-	numChunksToPersistDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, subsystem, "chunks_to_persist"),
-		"The current number of chunks waiting for persistence.",
-		nil, nil,
-	)
-	maxChunksToPersistDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, subsystem, "max_chunks_to_persist"),
-		"The maximum number of chunks that can be waiting for persistence before sample ingestion will stop.",
-		nil, nil,
-	)
+	selectorsTag = "selectors"
+	fromTag      = "from"
+	throughTag   = "through"
+	tsTag        = "ts"
+	numSeries    = "num_series"
 )
 
 type quarantineRequest struct {
@@ -142,12 +140,13 @@ type syncStrategy func() bool
 // interfacing with a persistence layer to make time series data persistent
 // across restarts and evictable from memory.
 type MemorySeriesStorage struct {
-	// archiveHighWatermark and numChunksToPersist have to be aligned for atomic operations.
+	// archiveHighWatermark, chunksToPersist, persistUrgency have to be aligned for atomic operations.
 	archiveHighWatermark model.Time    // No archived series has samples after this time.
 	numChunksToPersist   int64         // The number of chunks waiting for persistence.
-	maxChunksToPersist   int           // If numChunksToPersist reaches this threshold, ingestion will be throttled.
+	persistUrgency       int32         // Persistence urgency score * 1000, int32 allows atomic operations.
 	rushed               bool          // Whether the storage is in rushed mode.
-	rushedMtx            sync.Mutex    // Protects entering and exiting rushed mode.
+	rushedMtx            sync.Mutex    // Protects rushed.
+	lastNumGC            uint32        // To detect if a GC cycle has run.
 	throttled            chan struct{} // This chan is sent to whenever NeedsThrottling() returns true (for logging).
 
 	fpLocker   *fingerprintLocker
@@ -157,8 +156,9 @@ type MemorySeriesStorage struct {
 
 	loopStopping, loopStopped  chan struct{}
 	logThrottlingStopped       chan struct{}
-	maxMemoryChunks            int
+	targetHeapSize             uint64
 	dropAfter                  time.Duration
+	headChunkTimeout           time.Duration
 	checkpointInterval         time.Duration
 	checkpointDirtySeriesLimit int
 
@@ -172,25 +172,31 @@ type MemorySeriesStorage struct {
 	quarantineRequests                    chan quarantineRequest
 	quarantineStopping, quarantineStopped chan struct{}
 
-	persistErrors                 prometheus.Counter
-	numSeries                     prometheus.Gauge
-	seriesOps                     *prometheus.CounterVec
-	ingestedSamplesCount          prometheus.Counter
-	discardedSamplesCount         *prometheus.CounterVec
-	nonExistentSeriesMatchesCount prometheus.Counter
-	maintainSeriesDuration        *prometheus.SummaryVec
-	persistenceUrgencyScore       prometheus.Gauge
-	rushedMode                    prometheus.Gauge
+	persistErrors            prometheus.Counter
+	queuedChunksToPersist    prometheus.Counter
+	chunksToPersist          prometheus.GaugeFunc
+	memorySeries             prometheus.Gauge
+	headChunks               prometheus.Gauge
+	dirtySeries              prometheus.Gauge
+	seriesOps                *prometheus.CounterVec
+	ingestedSamples          prometheus.Counter
+	discardedSamples         *prometheus.CounterVec
+	nonExistentSeriesMatches prometheus.Counter
+	memChunks                prometheus.GaugeFunc
+	maintainSeriesDuration   *prometheus.SummaryVec
+	persistenceUrgencyScore  prometheus.GaugeFunc
+	rushedMode               prometheus.GaugeFunc
+	targetHeapSizeBytes      prometheus.GaugeFunc
 }
 
 // MemorySeriesStorageOptions contains options needed by
 // NewMemorySeriesStorage. It is not safe to leave any of those at their zero
 // values.
 type MemorySeriesStorageOptions struct {
-	MemoryChunks               int           // How many chunks to keep in memory.
-	MaxChunksToPersist         int           // Max number of chunks waiting to be persisted.
+	TargetHeapSize             uint64        // Desired maximum heap size.
 	PersistenceStoragePath     string        // Location of persistence files.
 	PersistenceRetentionPeriod time.Duration // Chunks at least that old are dropped.
+	HeadChunkTimeout           time.Duration // Head chunks idle for at least that long may be closed.
 	CheckpointInterval         time.Duration // How often to checkpoint the series map and head chunks.
 	CheckpointDirtySeriesLimit int           // How many dirty series will trigger an early checkpoint.
 	Dirty                      bool          // Force the storage to consider itself dirty on startup.
@@ -212,13 +218,12 @@ func NewMemorySeriesStorage(o *MemorySeriesStorageOptions) *MemorySeriesStorage 
 		loopStopped:                make(chan struct{}),
 		logThrottlingStopped:       make(chan struct{}),
 		throttled:                  make(chan struct{}, 1),
-		maxMemoryChunks:            o.MemoryChunks,
+		targetHeapSize:             o.TargetHeapSize,
 		dropAfter:                  o.PersistenceRetentionPeriod,
+		headChunkTimeout:           o.HeadChunkTimeout,
 		checkpointInterval:         o.CheckpointInterval,
 		checkpointDirtySeriesLimit: o.CheckpointDirtySeriesLimit,
-		archiveHighWatermark:       model.Now().Add(-headChunkTimeout),
-
-		maxChunksToPersist: o.MaxChunksToPersist,
+		archiveHighWatermark:       model.Now().Add(-o.HeadChunkTimeout),
 
 		evictList:     list.New(),
 		evictRequests: make(chan chunk.EvictRequest, evictRequestsCap),
@@ -233,13 +238,31 @@ func NewMemorySeriesStorage(o *MemorySeriesStorageOptions) *MemorySeriesStorage 
 			Namespace: namespace,
 			Subsystem: subsystem,
 			Name:      "persist_errors_total",
-			Help:      "The total number of errors while persisting chunks.",
+			Help:      "The total number of errors while writing to the persistence layer.",
 		}),
-		numSeries: prometheus.NewGauge(prometheus.GaugeOpts{
+		queuedChunksToPersist: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "queued_chunks_to_persist_total",
+			Help:      "The total number of chunks queued for persistence.",
+		}),
+		memorySeries: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
 			Name:      "memory_series",
 			Help:      "The current number of series in memory.",
+		}),
+		headChunks: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "open_head_chunks",
+			Help:      "The current number of open head chunks.",
+		}),
+		dirtySeries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "memory_dirty_series",
+			Help:      "The current number of series that would require a disk seek during crash recovery.",
 		}),
 		seriesOps: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -250,13 +273,13 @@ func NewMemorySeriesStorage(o *MemorySeriesStorageOptions) *MemorySeriesStorage 
 			},
 			[]string{opTypeLabel},
 		),
-		ingestedSamplesCount: prometheus.NewCounter(prometheus.CounterOpts{
+		ingestedSamples: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
 			Name:      "ingested_samples_total",
 			Help:      "The total number of samples ingested.",
 		}),
-		discardedSamplesCount: prometheus.NewCounterVec(
+		discardedSamples: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Subsystem: subsystem,
@@ -265,12 +288,21 @@ func NewMemorySeriesStorage(o *MemorySeriesStorageOptions) *MemorySeriesStorage 
 			},
 			[]string{discardReasonLabel},
 		),
-		nonExistentSeriesMatchesCount: prometheus.NewCounter(prometheus.CounterOpts{
+		nonExistentSeriesMatches: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
 			Name:      "non_existent_series_matches_total",
 			Help:      "How often a non-existent series was referred to during label matching or chunk preloading. This is an indication of outdated label indexes.",
 		}),
+		memChunks: prometheus.NewGaugeFunc(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Subsystem: subsystem,
+				Name:      "memory_chunks",
+				Help:      "The current number of chunks in memory. The number does not include cloned chunks (i.e. chunks without a descriptor).",
+			},
+			func() float64 { return float64(atomic.LoadInt64(&chunk.NumMemChunks)) },
+		),
 		maintainSeriesDuration: prometheus.NewSummaryVec(
 			prometheus.SummaryOpts{
 				Namespace: namespace,
@@ -280,24 +312,63 @@ func NewMemorySeriesStorage(o *MemorySeriesStorageOptions) *MemorySeriesStorage 
 			},
 			[]string{seriesLocationLabel},
 		),
-		persistenceUrgencyScore: prometheus.NewGauge(prometheus.GaugeOpts{
+	}
+
+	s.chunksToPersist = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "chunks_to_persist",
+			Help:      "The current number of chunks waiting for persistence.",
+		},
+		func() float64 {
+			return float64(s.getNumChunksToPersist())
+		},
+	)
+	s.rushedMode = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "rushed_mode",
+			Help:      "1 if the storage is in rushed mode, 0 otherwise.",
+		},
+		func() float64 {
+			s.rushedMtx.Lock()
+			defer s.rushedMtx.Unlock()
+			if s.rushed {
+				return 1
+			}
+			return 0
+		},
+	)
+	s.persistenceUrgencyScore = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
 			Name:      "persistence_urgency_score",
 			Help:      "A score of urgency to persist chunks, 0 is least urgent, 1 most.",
-		}),
-		rushedMode: prometheus.NewGauge(prometheus.GaugeOpts{
+		},
+		func() float64 {
+			score, _ := s.getPersistenceUrgencyScore()
+			return score
+		},
+	)
+	s.targetHeapSizeBytes = prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,
-			Name:      "rushed_mode",
-			Help:      "1 if the storage is in rushed mode, 0 otherwise. In rushed mode, the system behaves as if the persistence_urgency_score is 1.",
-		}),
-	}
+			Name:      "target_heap_size_bytes",
+			Help:      "The configured target heap size in bytes.",
+		},
+		func() float64 {
+			return float64(s.targetHeapSize)
+		},
+	)
 
 	// Initialize metric vectors.
 	// TODO(beorn7): Rework once we have a utility function for it in client_golang.
-	s.discardedSamplesCount.WithLabelValues(outOfOrderTimestamp)
-	s.discardedSamplesCount.WithLabelValues(duplicateSample)
+	s.discardedSamples.WithLabelValues(outOfOrderTimestamp)
+	s.discardedSamples.WithLabelValues(duplicateSample)
 	s.maintainSeriesDuration.WithLabelValues(maintainInMemory)
 	s.maintainSeriesDuration.WithLabelValues(maintainArchived)
 	s.seriesOps.WithLabelValues(create)
@@ -324,7 +395,10 @@ func (s *MemorySeriesStorage) Start() (err error) {
 	case Always:
 		syncStrategy = func() bool { return true }
 	case Adaptive:
-		syncStrategy = func() bool { return s.calculatePersistenceUrgencyScore() < 1 }
+		syncStrategy = func() bool {
+			_, rushed := s.getPersistenceUrgencyScore()
+			return !rushed
+		}
 	default:
 		panic("unknown sync strategy")
 	}
@@ -353,11 +427,17 @@ func (s *MemorySeriesStorage) Start() (err error) {
 
 	log.Info("Loading series map and head chunks...")
 	s.fpToSeries, s.numChunksToPersist, err = p.loadSeriesMapAndHeads()
+	for _, series := range s.fpToSeries.m {
+		if !series.headChunkClosed {
+			s.headChunks.Inc()
+		}
+	}
+
 	if err != nil {
 		return err
 	}
 	log.Infof("%d series loaded.", s.fpToSeries.length())
-	s.numSeries.Set(float64(s.fpToSeries.length()))
+	s.memorySeries.Set(float64(s.fpToSeries.length()))
 
 	s.mapper, err = newFPMapper(s.fpToSeries, p)
 	if err != nil {
@@ -389,7 +469,9 @@ func (s *MemorySeriesStorage) Stop() error {
 	<-s.evictStopped
 
 	// One final checkpoint of the series map and the head chunks.
-	if err := s.persistence.checkpointSeriesMapAndHeads(s.fpToSeries, s.fpLocker); err != nil {
+	if err := s.persistence.checkpointSeriesMapAndHeads(
+		context.Background(), s.fpToSeries, s.fpLocker,
+	); err != nil {
 		return err
 	}
 	if err := s.mapper.checkpoint(); err != nil {
@@ -492,11 +574,22 @@ func (bit *boundedIterator) Close() {
 }
 
 // QueryRange implements Storage.
-func (s *MemorySeriesStorage) QueryRange(_ context.Context, from, through model.Time, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
+func (s *MemorySeriesStorage) QueryRange(ctx context.Context, from, through model.Time, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
+	span, _ := opentracing.StartSpanFromContext(ctx, "QueryRange")
+	span.SetTag(selectorsTag, metric.LabelMatchers(matchers).String())
+	span.SetTag(fromTag, int64(from))
+	span.SetTag(throughTag, int64(through))
+	defer span.Finish()
+
+	if through.Before(from) {
+		// In that case, nothing will match.
+		return nil, nil
+	}
 	fpSeriesPairs, err := s.seriesForLabelMatchers(from, through, matchers...)
 	if err != nil {
 		return nil, err
 	}
+	span.SetTag(numSeries, len(fpSeriesPairs))
 	iterators := make([]SeriesIterator, 0, len(fpSeriesPairs))
 	for _, pair := range fpSeriesPairs {
 		it := s.preloadChunksForRange(pair, from, through)
@@ -506,7 +599,15 @@ func (s *MemorySeriesStorage) QueryRange(_ context.Context, from, through model.
 }
 
 // QueryInstant implements Storage.
-func (s *MemorySeriesStorage) QueryInstant(_ context.Context, ts model.Time, stalenessDelta time.Duration, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
+func (s *MemorySeriesStorage) QueryInstant(ctx context.Context, ts model.Time, stalenessDelta time.Duration, matchers ...*metric.LabelMatcher) ([]SeriesIterator, error) {
+	span, _ := opentracing.StartSpanFromContext(ctx, "QueryInstant")
+	span.SetTag(selectorsTag, metric.LabelMatchers(matchers).String())
+	span.SetTag(tsTag, ts)
+	defer span.Finish()
+
+	if stalenessDelta < 0 {
+		panic("negative staleness delta")
+	}
 	from := ts.Add(-stalenessDelta)
 	through := ts
 
@@ -761,7 +862,7 @@ func (s *MemorySeriesStorage) metricForRange(
 		// we have a chance the archived metric is not in the range.
 		has, first, last := s.persistence.hasArchivedMetric(fp)
 		if !has {
-			s.nonExistentSeriesMatchesCount.Inc()
+			s.nonExistentSeriesMatches.Inc()
 			return nil, nil, false
 		}
 		if first.After(through) || last.Before(from) {
@@ -838,13 +939,14 @@ func (s *MemorySeriesStorage) Append(sample *model.Sample) error {
 			sample.Value.Equal(series.lastSampleValue) {
 			return nil
 		}
-		s.discardedSamplesCount.WithLabelValues(duplicateSample).Inc()
+		s.discardedSamples.WithLabelValues(duplicateSample).Inc()
 		return ErrDuplicateSampleForTimestamp // Caused by the caller.
 	}
 	if sample.Timestamp < series.lastTime {
-		s.discardedSamplesCount.WithLabelValues(outOfOrderTimestamp).Inc()
+		s.discardedSamples.WithLabelValues(outOfOrderTimestamp).Inc()
 		return ErrOutOfOrderSample // Caused by the caller.
 	}
+	headChunkWasClosed := series.headChunkClosed
 	completedChunksCount, err := series.add(model.SamplePair{
 		Value:     sample.Value,
 		Timestamp: sample.Timestamp,
@@ -853,7 +955,12 @@ func (s *MemorySeriesStorage) Append(sample *model.Sample) error {
 		s.quarantineSeries(fp, sample.Metric, err)
 		return err
 	}
-	s.ingestedSamplesCount.Inc()
+	if headChunkWasClosed {
+		// Appending to a series with a closed head chunk creates an
+		// additional open head chunk.
+		s.headChunks.Inc()
+	}
+	s.ingestedSamples.Inc()
 	s.incNumChunksToPersist(completedChunksCount)
 
 	return nil
@@ -861,8 +968,7 @@ func (s *MemorySeriesStorage) Append(sample *model.Sample) error {
 
 // NeedsThrottling implements Storage.
 func (s *MemorySeriesStorage) NeedsThrottling() bool {
-	if s.getNumChunksToPersist() > s.maxChunksToPersist ||
-		float64(atomic.LoadInt64(&chunk.NumMemChunks)) > float64(s.maxMemoryChunks)*toleranceFactorMemChunks {
+	if score, _ := s.getPersistenceUrgencyScore(); score >= 1 {
 		select {
 		case s.throttled <- struct{}{}:
 		default: // Do nothing, signal already pending.
@@ -893,19 +999,19 @@ func (s *MemorySeriesStorage) logThrottling() {
 		select {
 		case <-s.throttled:
 			if !timer.Reset(time.Minute) {
+				score, _ := s.getPersistenceUrgencyScore()
 				log.
+					With("urgencyScore", score).
 					With("chunksToPersist", s.getNumChunksToPersist()).
-					With("maxChunksToPersist", s.maxChunksToPersist).
 					With("memoryChunks", atomic.LoadInt64(&chunk.NumMemChunks)).
-					With("maxToleratedMemChunks", int(float64(s.maxMemoryChunks)*toleranceFactorMemChunks)).
 					Error("Storage needs throttling. Scrapes and rule evaluations will be skipped.")
 			}
 		case <-timer.C:
+			score, _ := s.getPersistenceUrgencyScore()
 			log.
+				With("urgencyScore", score).
 				With("chunksToPersist", s.getNumChunksToPersist()).
-				With("maxChunksToPersist", s.maxChunksToPersist).
 				With("memoryChunks", atomic.LoadInt64(&chunk.NumMemChunks)).
-				With("maxToleratedMemChunks", int(float64(s.maxMemoryChunks)*toleranceFactorMemChunks)).
 				Info("Storage does not need throttling anymore.")
 		case <-s.loopStopping:
 			return
@@ -931,6 +1037,9 @@ func (s *MemorySeriesStorage) getOrCreateSeries(fp model.Fingerprint, m model.Me
 			// while (which is confusing as it makes the series
 			// appear as archived or purged).
 			cds, err = s.loadChunkDescs(fp, 0)
+			if err == nil && len(cds) == 0 {
+				err = fmt.Errorf("unarchived fingerprint %v (metric %v) has no chunks on disk", fp, m)
+			}
 			if err != nil {
 				s.quarantineSeries(fp, m, err)
 				return nil, err
@@ -947,7 +1056,10 @@ func (s *MemorySeriesStorage) getOrCreateSeries(fp model.Fingerprint, m model.Me
 			return nil, err
 		}
 		s.fpToSeries.put(fp, series)
-		s.numSeries.Inc()
+		s.memorySeries.Inc()
+		if !series.headChunkClosed {
+			s.headChunks.Inc()
+		}
 	}
 	return series, nil
 }
@@ -1011,23 +1123,16 @@ func (s *MemorySeriesStorage) preloadChunksForInstant(
 }
 
 func (s *MemorySeriesStorage) handleEvictList() {
-	ticker := time.NewTicker(maxEvictInterval)
-	count := 0
+	// This ticker is supposed to tick at least once per GC cyle. Ideally,
+	// we would handle the evict list after each finished GC cycle, but I
+	// don't know of a way to "subscribe" to that kind of event.
+	ticker := time.NewTicker(evictInterval)
 
 	for {
-		// To batch up evictions a bit, this tries evictions at least
-		// once per evict interval, but earlier if the number of evict
-		// requests with evict==true that have happened since the last
-		// evict run is more than maxMemoryChunks/1000.
 		select {
 		case req := <-s.evictRequests:
 			if req.Evict {
 				req.Desc.EvictListElement = s.evictList.PushBack(req.Desc)
-				count++
-				if count > s.maxMemoryChunks/1000 {
-					s.maybeEvict()
-					count = 0
-				}
 			} else {
 				if req.Desc.EvictListElement != nil {
 					s.evictList.Remove(req.Desc.EvictListElement)
@@ -1035,9 +1140,7 @@ func (s *MemorySeriesStorage) handleEvictList() {
 				}
 			}
 		case <-ticker.C:
-			if s.evictList.Len() > 0 {
-				s.maybeEvict()
-			}
+			s.maybeEvict()
 		case <-s.evictStopping:
 			// Drain evictRequests forever in a goroutine to not let
 			// requesters hang.
@@ -1056,10 +1159,14 @@ func (s *MemorySeriesStorage) handleEvictList() {
 
 // maybeEvict is a local helper method. Must only be called by handleEvictList.
 func (s *MemorySeriesStorage) maybeEvict() {
-	numChunksToEvict := int(atomic.LoadInt64(&chunk.NumMemChunks)) - s.maxMemoryChunks
+	ms := runtime.MemStats{}
+	runtime.ReadMemStats(&ms)
+	numChunksToEvict := s.calculatePersistUrgency(&ms)
+
 	if numChunksToEvict <= 0 {
 		return
 	}
+
 	chunkDescsToEvict := make([]*chunk.Desc, numChunksToEvict)
 	for i := range chunkDescsToEvict {
 		e := s.evictList.Front()
@@ -1091,6 +1198,118 @@ func (s *MemorySeriesStorage) maybeEvict() {
 			// evict list once it gets Unpinned again.
 		}
 	}()
+}
+
+// calculatePersistUrgency calculates and sets s.persistUrgency. Based on the
+// calculation, it returns the number of chunks to evict. The runtime.MemStats
+// are passed in here for testability.
+//
+// The persist urgency is calculated by the following formula:
+//
+//                      n(toPersist)           MAX( h(nextGC), h(current) )
+//   p = MIN( 1, --------------------------- * ---------------------------- )
+//               n(toPersist) + n(evictable)             h(target)
+//
+// where:
+//
+//    n(toPersist): Number of chunks waiting for persistence.
+//    n(evictable): Number of evictable chunks.
+//    h(nextGC):    Heap size at which the next GC will kick in (ms.NextGC).
+//    h(current):   Current heap size (ms.HeapAlloc).
+//    h(target):    Configured target heap size.
+//
+// Note that the actual value stored in s.persistUrgency is 1000 times the value
+// calculated as above to allow using an int32, which supports atomic
+// operations.
+//
+// If no GC has run after the last call of this method, it will always return 0
+// (no reason to try to evict any more chunks before we have seen the effect of
+// the previous eviction). It will also not decrease the persist urgency in this
+// case (but it will increase the persist urgency if a higher value was calculated).
+//
+// If a GC has run after the last call of this method, the following cases apply:
+//
+// - If MAX( h(nextGC), h(current) ) < h(target), simply return 0. Nothing to
+//   evict if the heap is still small enough.
+//
+// - Otherwise, if n(evictable) is 0, also return 0, but set the urgency score
+//   to 1 to signal that we want to evict chunk but have no evictable chunks
+//   available.
+//
+// - Otherwise, calculate the number of chunks to evict and return it:
+//
+//                                   MAX( h(nextGC), h(current) ) - h(target)
+//   n(toEvict) = MIN( n(evictable), ---------------------------------------- )
+//                                                        c
+//
+//   where c is the size of a chunk.
+//
+// - In the latter case, the persist urgency might be increased. The final value
+//   is the following:
+//
+//            n(toEvict)
+//   MAX( p, ------------ )
+//           n(evictable)
+//
+// Broadly speaking, the persist urgency is based on the ratio of the number of
+// chunks we want to evict and the number of chunks that are actually
+// evictable. However, in particular for the case where we don't need to evict
+// chunks yet, it also takes into account how close the heap has already grown
+// to the configured target size, and how big the pool of chunks to persist is
+// compared to the number of chunks already evictable.
+//
+// This is a helper method only to be called by MemorySeriesStorage.maybeEvict.
+func (s *MemorySeriesStorage) calculatePersistUrgency(ms *runtime.MemStats) int {
+	var (
+		oldUrgency         = atomic.LoadInt32(&s.persistUrgency)
+		newUrgency         int32
+		numChunksToPersist = s.getNumChunksToPersist()
+	)
+	defer func() {
+		if newUrgency > 1000 {
+			newUrgency = 1000
+		}
+		atomic.StoreInt32(&s.persistUrgency, newUrgency)
+	}()
+
+	// Take the NextGC as the relevant heap size because the heap will grow
+	// to that size before GC kicks in. However, at times the current heap
+	// is already larger than NextGC, in which case we take that worse case.
+	heapSize := ms.NextGC
+	if ms.HeapAlloc > ms.NextGC {
+		heapSize = ms.HeapAlloc
+	}
+
+	if numChunksToPersist > 0 {
+		newUrgency = int32(1000 * uint64(numChunksToPersist) / uint64(numChunksToPersist+s.evictList.Len()) * heapSize / s.targetHeapSize)
+	}
+
+	// Only continue if a GC has happened since we were here last time.
+	if ms.NumGC == s.lastNumGC {
+		if oldUrgency > newUrgency {
+			// Never reduce urgency without a GC run.
+			newUrgency = oldUrgency
+		}
+		return 0
+	}
+	s.lastNumGC = ms.NumGC
+
+	if heapSize <= s.targetHeapSize {
+		return 0 // Heap still small enough, don't evict.
+	}
+	if s.evictList.Len() == 0 {
+		// We want to reduce heap size but there is nothing to evict.
+		newUrgency = 1000
+		return 0
+	}
+	numChunksToEvict := int((heapSize - s.targetHeapSize) / chunk.ChunkLen)
+	if numChunksToEvict > s.evictList.Len() {
+		numChunksToEvict = s.evictList.Len()
+	}
+	if u := int32(numChunksToEvict * 1000 / s.evictList.Len()); u > newUrgency {
+		newUrgency = u
+	}
+	return numChunksToEvict
 }
 
 // waitForNextFP waits an estimated duration, after which we want to process
@@ -1137,16 +1356,8 @@ func (s *MemorySeriesStorage) waitForNextFP(numberOfFPs int, maxWaitDurationFact
 func (s *MemorySeriesStorage) cycleThroughMemoryFingerprints() chan model.Fingerprint {
 	memoryFingerprints := make(chan model.Fingerprint)
 	go func() {
-		var fpIter <-chan model.Fingerprint
-
-		defer func() {
-			if fpIter != nil {
-				for range fpIter {
-					// Consume the iterator.
-				}
-			}
-			close(memoryFingerprints)
-		}()
+		defer close(memoryFingerprints)
+		firstPass := true
 
 		for {
 			// Initial wait, also important if there are no FPs yet.
@@ -1154,24 +1365,39 @@ func (s *MemorySeriesStorage) cycleThroughMemoryFingerprints() chan model.Finger
 				return
 			}
 			begin := time.Now()
-			fpIter = s.fpToSeries.fpIter()
+			fps := s.fpToSeries.sortedFPs()
+			if firstPass && len(fps) > 0 {
+				// Start first pass at a random location in the
+				// key space to cover the whole key space even
+				// in the case of frequent restarts.
+				fps = fps[rand.Intn(len(fps)):]
+			}
 			count := 0
-			for fp := range fpIter {
+			for _, fp := range fps {
 				select {
 				case memoryFingerprints <- fp:
 				case <-s.loopStopping:
 					return
 				}
 				// Reduce the wait time according to the urgency score.
-				s.waitForNextFP(s.fpToSeries.length(), 1-s.calculatePersistenceUrgencyScore())
+				score, rushed := s.getPersistenceUrgencyScore()
+				if rushed {
+					score = 1
+				}
+				s.waitForNextFP(s.fpToSeries.length(), 1-score)
 				count++
 			}
 			if count > 0 {
+				msg := "full"
+				if firstPass {
+					msg = "initial partial"
+				}
 				log.Infof(
-					"Completed maintenance sweep through %d in-memory fingerprints in %v.",
-					count, time.Since(begin),
+					"Completed %s maintenance sweep through %d in-memory fingerprints in %v.",
+					msg, count, time.Since(begin),
 				)
 			}
+			firstPass = false
 		}
 	}()
 
@@ -1222,11 +1448,13 @@ func (s *MemorySeriesStorage) cycleThroughArchivedFingerprints() chan model.Fing
 
 func (s *MemorySeriesStorage) loop() {
 	checkpointTimer := time.NewTimer(s.checkpointInterval)
+	checkpointMinTimer := time.NewTimer(0)
 
-	dirtySeriesCount := 0
+	var dirtySeriesCount int64
 
 	defer func() {
 		checkpointTimer.Stop()
+		checkpointMinTimer.Stop()
 		log.Info("Maintenance loop stopped.")
 		close(s.loopStopped)
 	}()
@@ -1234,38 +1462,86 @@ func (s *MemorySeriesStorage) loop() {
 	memoryFingerprints := s.cycleThroughMemoryFingerprints()
 	archivedFingerprints := s.cycleThroughArchivedFingerprints()
 
+	checkpointCtx, checkpointCancel := context.WithCancel(context.Background())
+	checkpointNow := make(chan struct{}, 1)
+
+	doCheckpoint := func() time.Duration {
+		start := time.Now()
+		// We clear this before the checkpoint so that dirtySeriesCount
+		// is an upper bound.
+		atomic.StoreInt64(&dirtySeriesCount, 0)
+		s.dirtySeries.Set(0)
+		select {
+		case <-checkpointNow:
+			// Signal cleared.
+		default:
+			// No signal pending.
+		}
+		err := s.persistence.checkpointSeriesMapAndHeads(
+			checkpointCtx, s.fpToSeries, s.fpLocker,
+		)
+		if err == context.Canceled {
+			log.Info("Checkpoint canceled.")
+		} else if err != nil {
+			s.persistErrors.Inc()
+			log.Errorln("Error while checkpointing:", err)
+		}
+		return time.Since(start)
+	}
+
+	// Checkpoints can happen concurrently with maintenance so even with heavy
+	// checkpointing there will still be sufficient progress on maintenance.
+	checkpointLoopStopped := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-checkpointCtx.Done():
+				checkpointLoopStopped <- struct{}{}
+				return
+			case <-checkpointMinTimer.C:
+				var took time.Duration
+				select {
+				case <-checkpointCtx.Done():
+					checkpointLoopStopped <- struct{}{}
+					return
+				case <-checkpointTimer.C:
+					took = doCheckpoint()
+				case <-checkpointNow:
+					if !checkpointTimer.Stop() {
+						<-checkpointTimer.C
+					}
+					took = doCheckpoint()
+				}
+				checkpointMinTimer.Reset(took)
+				checkpointTimer.Reset(s.checkpointInterval)
+			}
+		}
+	}()
+
 loop:
 	for {
 		select {
 		case <-s.loopStopping:
+			checkpointCancel()
 			break loop
-		case <-checkpointTimer.C:
-			err := s.persistence.checkpointSeriesMapAndHeads(s.fpToSeries, s.fpLocker)
-			if err != nil {
-				log.Errorln("Error while checkpointing:", err)
-			} else {
-				dirtySeriesCount = 0
-			}
-			// If a checkpoint takes longer than checkpointInterval, unluckily timed
-			// combination with the Reset(0) call below can lead to a case where a
-			// time is lurking in C leading to repeated checkpointing without break.
-			select {
-			case <-checkpointTimer.C: // Get rid of the lurking time.
-			default:
-			}
-			checkpointTimer.Reset(s.checkpointInterval)
 		case fp := <-memoryFingerprints:
 			if s.maintainMemorySeries(fp, model.Now().Add(-s.dropAfter)) {
-				dirtySeriesCount++
+				dirty := atomic.AddInt64(&dirtySeriesCount, 1)
+				s.dirtySeries.Set(float64(dirty))
 				// Check if we have enough "dirty" series so that we need an early checkpoint.
 				// However, if we are already behind persisting chunks, creating a checkpoint
 				// would be counterproductive, as it would slow down chunk persisting even more,
 				// while in a situation like that, where we are clearly lacking speed of disk
 				// maintenance, the best we can do for crash recovery is to persist chunks as
-				// quickly as possible. So only checkpoint if the urgency score is < 1.
-				if dirtySeriesCount >= s.checkpointDirtySeriesLimit &&
-					s.calculatePersistenceUrgencyScore() < 1 {
-					checkpointTimer.Reset(0)
+				// quickly as possible. So only checkpoint if we are not in rushed mode.
+				if _, rushed := s.getPersistenceUrgencyScore(); !rushed &&
+					dirty >= int64(s.checkpointDirtySeriesLimit) {
+					select {
+					case checkpointNow <- struct{}{}:
+						// Signal sent.
+					default:
+						// Signal already pending.
+					}
 				}
 			}
 		case fp := <-archivedFingerprints:
@@ -1277,6 +1553,7 @@ loop:
 	}
 	for range archivedFingerprints {
 	}
+	<-checkpointLoopStopped
 }
 
 // maintainMemorySeries maintains a series that is in memory (i.e. not
@@ -1330,8 +1607,14 @@ func (s *MemorySeriesStorage) maintainMemorySeries(
 
 	defer s.seriesOps.WithLabelValues(memoryMaintenance).Inc()
 
-	if series.maybeCloseHeadChunk() {
+	closed, err := series.maybeCloseHeadChunk(s.headChunkTimeout)
+	if err != nil {
+		s.quarantineSeries(fp, series.metric, err)
+		s.persistErrors.Inc()
+	}
+	if closed {
 		s.incNumChunksToPersist(1)
+		s.headChunks.Dec()
 	}
 
 	seriesWasDirty := series.dirty
@@ -1351,9 +1634,9 @@ func (s *MemorySeriesStorage) maintainMemorySeries(
 
 	// Archive if all chunks are evicted. Also make sure the last sample has
 	// an age of at least headChunkTimeout (which is very likely anyway).
-	if iOldestNotEvicted == -1 && model.Now().Sub(series.lastTime) > headChunkTimeout {
+	if iOldestNotEvicted == -1 && model.Now().Sub(series.lastTime) > s.headChunkTimeout {
 		s.fpToSeries.del(fp)
-		s.numSeries.Dec()
+		s.memorySeries.Dec()
 		s.persistence.archiveMetric(fp, series.metric, series.firstTime(), series.lastTime)
 		s.seriesOps.WithLabelValues(archive).Inc()
 		oldWatermark := atomic.LoadInt64((*int64)(&s.archiveHighWatermark))
@@ -1367,7 +1650,7 @@ func (s *MemorySeriesStorage) maintainMemorySeries(
 		}
 		return
 	}
-	// If we are here, the series is not archived, so check for Chunk.Desc
+	// If we are here, the series is not archived, so check for chunk.Desc
 	// eviction next.
 	series.evictChunkDescs(iOldestNotEvicted)
 
@@ -1381,6 +1664,11 @@ func (s *MemorySeriesStorage) maintainMemorySeries(
 // not empty, those chunks are simply appended to the series file. If the series
 // contains no chunks after dropping old chunks, it is purged entirely. In that
 // case, the method returns true.
+//
+// If a persist error is encountered, the series is queued for quarantine. In
+// that case, the method returns true, too, because the series should not be
+// processed anymore (even if it will only be gone for real once quarantining
+// has been completed).
 //
 // The caller must have locked the fp.
 func (s *MemorySeriesStorage) writeMemorySeries(
@@ -1423,7 +1711,7 @@ func (s *MemorySeriesStorage) writeMemorySeries(
 		var offset int
 		offset, persistErr = s.persistence.persistChunks(fp, chunks)
 		if persistErr != nil {
-			return false
+			return true
 		}
 		if series.chunkDescsOffset == -1 {
 			// This is the first chunk persisted for a newly created
@@ -1437,15 +1725,15 @@ func (s *MemorySeriesStorage) writeMemorySeries(
 	newFirstTime, offset, numDroppedFromPersistence, allDroppedFromPersistence, persistErr :=
 		s.persistence.dropAndPersistChunks(fp, beforeTime, chunks)
 	if persistErr != nil {
-		return false
+		return true
 	}
 	if persistErr = series.dropChunks(beforeTime); persistErr != nil {
-		return false
+		return true
 	}
 	if len(series.chunkDescs) == 0 && allDroppedFromPersistence {
 		// All chunks dropped from both memory and persistence. Delete the series for good.
 		s.fpToSeries.del(fp)
-		s.numSeries.Dec()
+		s.memorySeries.Dec()
 		s.seriesOps.WithLabelValues(memoryPurge).Inc()
 		s.persistence.unindexMetric(fp, series.metric)
 		return true
@@ -1457,7 +1745,8 @@ func (s *MemorySeriesStorage) writeMemorySeries(
 		series.chunkDescsOffset -= numDroppedFromPersistence
 		if series.chunkDescsOffset < 0 {
 			persistErr = errors.New("dropped more chunks from persistence than from memory")
-			series.chunkDescsOffset = -1
+			series.chunkDescsOffset = 0
+			return true
 		}
 	}
 	return false
@@ -1485,14 +1774,20 @@ func (s *MemorySeriesStorage) maintainArchivedSeries(fp model.Fingerprint, befor
 
 	newFirstTime, _, _, allDropped, err := s.persistence.dropAndPersistChunks(fp, beforeTime, nil)
 	if err != nil {
+		// TODO(beorn7): Should quarantine the series.
+		s.persistErrors.Inc()
 		log.Error("Error dropping persisted chunks: ", err)
 	}
 	if allDropped {
-		s.persistence.purgeArchivedMetric(fp) // Ignoring error. Nothing we can do.
+		if err := s.persistence.purgeArchivedMetric(fp); err != nil {
+			s.persistErrors.Inc()
+			// purgeArchivedMetric logs the error already.
+		}
 		s.seriesOps.WithLabelValues(archivePurge).Inc()
 		return
 	}
 	if err := s.persistence.updateArchivedTimeRange(fp, newFirstTime, lastTime); err != nil {
+		s.persistErrors.Inc()
 		log.Errorf("Error updating archived time range for fingerprint %v: %s", fp, err)
 	}
 }
@@ -1507,100 +1802,71 @@ func (s *MemorySeriesStorage) loadChunkDescs(fp model.Fingerprint, offsetFromEnd
 	return s.persistence.loadChunkDescs(fp, offsetFromEnd)
 }
 
-// getNumChunksToPersist returns numChunksToPersist in a goroutine-safe way.
+// getNumChunksToPersist returns chunksToPersist in a goroutine-safe way.
 func (s *MemorySeriesStorage) getNumChunksToPersist() int {
 	return int(atomic.LoadInt64(&s.numChunksToPersist))
 }
 
-// incNumChunksToPersist increments numChunksToPersist in a goroutine-safe way. Use a
+// incNumChunksToPersist increments chunksToPersist in a goroutine-safe way. Use a
 // negative 'by' to decrement.
 func (s *MemorySeriesStorage) incNumChunksToPersist(by int) {
 	atomic.AddInt64(&s.numChunksToPersist, int64(by))
+	if by > 0 {
+		s.queuedChunksToPersist.Add(float64(by))
+	}
 }
 
-// calculatePersistenceUrgencyScore calculates and returns an urgency score for
-// the speed of persisting chunks. The score is between 0 and 1, where 0 means
-// no urgency at all and 1 means highest urgency.
+// getPersistenceUrgencyScore returns an urgency score for the speed of
+// persisting chunks. The score is between 0 and 1, where 0 means no urgency at
+// all and 1 means highest urgency. It also returns if the storage is in
+// "rushed mode".
 //
-// The score is the maximum of the two following sub-scores:
+// The storage enters "rushed mode" if the score exceeds
+// persintenceUrgencyScoreForEnteringRushedMode at the time this method is
+// called. It will leave "rushed mode" if, at a later time this method is
+// called, the score is below persintenceUrgencyScoreForLeavingRushedMode.
+// "Rushed mode" plays a role for the adaptive series-sync-strategy. It also
+// switches off early checkpointing (due to dirty series), and it makes series
+// maintenance happen as quickly as possible.
 //
-// (1) The first sub-score is the number of chunks waiting for persistence
-// divided by the maximum number of chunks allowed to be waiting for
-// persistence.
+// A score of 1 will trigger throttling of sample ingestion.
 //
-// (2) If there are more chunks in memory than allowed AND there are more chunks
-// waiting for persistence than factorMinChunksToPersist times
-// -storage.local.max-chunks-to-persist, then the second sub-score is the
-// fraction the number of memory chunks has reached between
-// -storage.local.memory-chunks and toleranceFactorForMemChunks times
-// -storage.local.memory-chunks.
-//
-// Should the score ever hit persintenceUrgencyScoreForEnteringRushedMode, the
-// storage locks into "rushed mode", in which the returned score is always
-// bumped up to 1 until the non-bumped score is below
-// persintenceUrgencyScoreForLeavingRushedMode.
-//
-// This method is not goroutine-safe, but it is only ever called by the single
-// goroutine that is in charge of series maintenance. According to the returned
-// score, series maintenance should be sped up. If a score of 1 is returned,
-// checkpointing based on dirty-series count should be disabled, and series
-// files should not by synced anymore provided the user has specified the
-// adaptive sync strategy.
-func (s *MemorySeriesStorage) calculatePersistenceUrgencyScore() float64 {
+// It is safe to call this method concurrently.
+func (s *MemorySeriesStorage) getPersistenceUrgencyScore() (float64, bool) {
 	s.rushedMtx.Lock()
 	defer s.rushedMtx.Unlock()
 
-	var (
-		chunksToPersist    = float64(s.getNumChunksToPersist())
-		maxChunksToPersist = float64(s.maxChunksToPersist)
-		memChunks          = float64(atomic.LoadInt64(&chunk.NumMemChunks))
-		maxMemChunks       = float64(s.maxMemoryChunks)
-	)
-	score := chunksToPersist / maxChunksToPersist
-	if chunksToPersist > maxChunksToPersist*factorMinChunksToPersist {
-		score = math.Max(
-			score,
-			(memChunks/maxMemChunks-1)/(toleranceFactorMemChunks-1),
-		)
-	}
+	score := float64(atomic.LoadInt32(&s.persistUrgency)) / 1000
 	if score > 1 {
 		score = 1
 	}
-	s.persistenceUrgencyScore.Set(score)
 
 	if s.rushed {
 		// We are already in rushed mode. If the score is still above
-		// persintenceUrgencyScoreForLeavingRushedMode, return 1 and
-		// leave things as they are.
+		// persintenceUrgencyScoreForLeavingRushedMode, return the score
+		// and leave things as they are.
 		if score > persintenceUrgencyScoreForLeavingRushedMode {
-			return 1
+			return score, true
 		}
 		// We are out of rushed mode!
 		s.rushed = false
-		s.rushedMode.Set(0)
 		log.
 			With("urgencyScore", score).
-			With("chunksToPersist", int(chunksToPersist)).
-			With("maxChunksToPersist", int(maxChunksToPersist)).
-			With("memoryChunks", int(memChunks)).
-			With("maxMemoryChunks", int(maxMemChunks)).
+			With("chunksToPersist", s.getNumChunksToPersist()).
+			With("memoryChunks", atomic.LoadInt64(&chunk.NumMemChunks)).
 			Info("Storage has left rushed mode.")
-		return score
+		return score, false
 	}
 	if score > persintenceUrgencyScoreForEnteringRushedMode {
 		// Enter rushed mode.
 		s.rushed = true
-		s.rushedMode.Set(1)
 		log.
 			With("urgencyScore", score).
-			With("chunksToPersist", int(chunksToPersist)).
-			With("maxChunksToPersist", int(maxChunksToPersist)).
-			With("memoryChunks", int(memChunks)).
-			With("maxMemoryChunks", int(maxMemChunks)).
+			With("chunksToPersist", s.getNumChunksToPersist()).
+			With("memoryChunks", atomic.LoadInt64(&chunk.NumMemChunks)).
 			Warn("Storage has entered rushed mode.")
-		return 1
 	}
-	return score
+	return score, s.rushed
 }
 
 // quarantineSeries registers the provided fingerprint for quarantining. It
@@ -1660,10 +1926,10 @@ func (s *MemorySeriesStorage) purgeSeries(fp model.Fingerprint, m model.Metric, 
 
 	if series, ok = s.fpToSeries.get(fp); ok {
 		s.fpToSeries.del(fp)
-		s.numSeries.Dec()
+		s.memorySeries.Dec()
 		m = series.metric
 
-		// Adjust s.numChunksToPersist and chunk.NumMemChunks down by
+		// Adjust s.chunksToPersist and chunk.NumMemChunks down by
 		// the number of chunks in this series that are not
 		// persisted yet. Persisted chunks will be deducted from
 		// chunk.NumMemChunks upon eviction.
@@ -1719,17 +1985,20 @@ func (s *MemorySeriesStorage) Describe(ch chan<- *prometheus.Desc) {
 	s.mapper.Describe(ch)
 
 	ch <- s.persistErrors.Desc()
-	ch <- maxChunksToPersistDesc
-	ch <- numChunksToPersistDesc
-	ch <- s.numSeries.Desc()
+	ch <- s.queuedChunksToPersist.Desc()
+	ch <- s.chunksToPersist.Desc()
+	ch <- s.memorySeries.Desc()
+	ch <- s.headChunks.Desc()
+	ch <- s.dirtySeries.Desc()
 	s.seriesOps.Describe(ch)
-	ch <- s.ingestedSamplesCount.Desc()
-	s.discardedSamplesCount.Describe(ch)
-	ch <- s.nonExistentSeriesMatchesCount.Desc()
-	ch <- chunk.NumMemChunksDesc
+	ch <- s.ingestedSamples.Desc()
+	s.discardedSamples.Describe(ch)
+	ch <- s.nonExistentSeriesMatches.Desc()
+	ch <- s.memChunks.Desc()
 	s.maintainSeriesDuration.Describe(ch)
 	ch <- s.persistenceUrgencyScore.Desc()
 	ch <- s.rushedMode.Desc()
+	ch <- s.targetHeapSizeBytes.Desc()
 }
 
 // Collect implements prometheus.Collector.
@@ -1738,27 +2007,18 @@ func (s *MemorySeriesStorage) Collect(ch chan<- prometheus.Metric) {
 	s.mapper.Collect(ch)
 
 	ch <- s.persistErrors
-	ch <- prometheus.MustNewConstMetric(
-		maxChunksToPersistDesc,
-		prometheus.GaugeValue,
-		float64(s.maxChunksToPersist),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		numChunksToPersistDesc,
-		prometheus.GaugeValue,
-		float64(s.getNumChunksToPersist()),
-	)
-	ch <- s.numSeries
+	ch <- s.queuedChunksToPersist
+	ch <- s.chunksToPersist
+	ch <- s.memorySeries
+	ch <- s.headChunks
+	ch <- s.dirtySeries
 	s.seriesOps.Collect(ch)
-	ch <- s.ingestedSamplesCount
-	s.discardedSamplesCount.Collect(ch)
-	ch <- s.nonExistentSeriesMatchesCount
-	ch <- prometheus.MustNewConstMetric(
-		chunk.NumMemChunksDesc,
-		prometheus.GaugeValue,
-		float64(atomic.LoadInt64(&chunk.NumMemChunks)),
-	)
+	ch <- s.ingestedSamples
+	s.discardedSamples.Collect(ch)
+	ch <- s.nonExistentSeriesMatches
+	ch <- s.memChunks
 	s.maintainSeriesDuration.Collect(ch)
 	ch <- s.persistenceUrgencyScore
 	ch <- s.rushedMode
+	ch <- s.targetHeapSizeBytes
 }

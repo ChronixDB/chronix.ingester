@@ -62,9 +62,9 @@ func (p *persistence) recoverFromCrash(fingerprintToSeries map[model.Fingerprint
 		if err != nil {
 			return err
 		}
-		defer dir.Close()
 		for fis := []os.FileInfo{}; err != io.EOF; fis, err = dir.Readdir(1024) {
 			if err != nil {
+				dir.Close()
 				return err
 			}
 			for _, fi := range fis {
@@ -78,6 +78,7 @@ func (p *persistence) recoverFromCrash(fingerprintToSeries map[model.Fingerprint
 				}
 			}
 		}
+		dir.Close()
 	}
 	log.Infof("File scan complete. %d series found.", len(fpsSeen))
 
@@ -85,11 +86,12 @@ func (p *persistence) recoverFromCrash(fingerprintToSeries map[model.Fingerprint
 	for fp, s := range fingerprintToSeries {
 		if _, seen := fpsSeen[fp]; !seen {
 			// fp exists in fingerprintToSeries, but has no representation on disk.
-			if s.persistWatermark == len(s.chunkDescs) {
+			if s.persistWatermark >= len(s.chunkDescs) {
 				// Oops, everything including the head chunk was
-				// already persisted, but nothing on disk.
-				// Thus, we lost that series completely. Clean
-				// up the remnants.
+				// already persisted, but nothing on disk. Or
+				// the persistWatermark is plainly wrong. Thus,
+				// we lost that series completely. Clean up the
+				// remnants.
 				delete(fingerprintToSeries, fp)
 				if err := p.purgeArchivedMetric(fp); err != nil {
 					// Purging the archived metric didn't work, so try
@@ -303,6 +305,8 @@ func (p *persistence) sanitizeSeries(
 			}
 			s.persistWatermark = len(cds)
 			s.modTime = modTime
+			// Finally, evict again all chunk.Descs except the latest one to save memory.
+			s.evictChunkDescs(len(cds) - 1)
 			return fp, true
 		}
 		// This is the tricky one: We have chunks from heads.db, but
@@ -355,6 +359,8 @@ func (p *persistence) sanitizeSeries(
 			atomic.AddInt64(&chunk.NumMemChunks, int64(-len(s.chunkDescs)))
 			s.chunkDescs = cds
 			s.headChunkClosed = true
+			// Finally, evict again all chunk.Descs except the latest one to save memory.
+			s.evictChunkDescs(len(cds) - 1)
 			return fp, true
 		}
 		log.Warnf(
@@ -363,11 +369,15 @@ func (p *persistence) sanitizeSeries(
 		)
 		chunk.NumMemDescs.Sub(float64(keepIdx))
 		atomic.AddInt64(&chunk.NumMemChunks, int64(-keepIdx))
+		chunkDescsToEvict := len(cds)
 		if keepIdx == len(s.chunkDescs) {
 			// No chunks from series file left, head chunk is evicted, so declare it closed.
 			s.headChunkClosed = true
+			chunkDescsToEvict-- // Keep one chunk.Desc in this case to avoid a series with zero chunk.Descs.
 		}
 		s.chunkDescs = append(cds, s.chunkDescs[keepIdx:]...)
+		// Finally, evict again chunk.Descs without chunk to save memory.
+		s.evictChunkDescs(chunkDescsToEvict)
 		return fp, true
 	}
 	// This series is supposed to be archived.
@@ -457,6 +467,8 @@ func (p *persistence) cleanUpArchiveIndexes(
 			return err
 		}
 		fpToSeries[model.Fingerprint(fp)] = series
+		// Evict all but one chunk.Desc to save memory.
+		series.evictChunkDescs(len(cds) - 1)
 		return nil
 	}); err != nil {
 		return err
