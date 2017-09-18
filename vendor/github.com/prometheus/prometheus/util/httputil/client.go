@@ -18,10 +18,8 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
-	"net/url"
-	"time"
+	"strings"
 
 	"github.com/prometheus/prometheus/config"
 )
@@ -31,37 +29,46 @@ func NewClient(rt http.RoundTripper) *http.Client {
 	return &http.Client{Transport: rt}
 }
 
-// NewDeadlineClient returns a new http.Client which will time out long running
-// requests.
-func NewDeadlineClient(timeout time.Duration, proxyURL *url.URL) *http.Client {
-	return NewClient(NewDeadlineRoundTripper(timeout, proxyURL))
-}
-
-// NewDeadlineRoundTripper returns a new http.RoundTripper which will time out
-// long running requests.
-func NewDeadlineRoundTripper(timeout time.Duration, proxyURL *url.URL) http.RoundTripper {
-	return &http.Transport{
-		// Set proxy (if null, then becomes a direct connection)
-		Proxy: http.ProxyURL(proxyURL),
-		// We need to disable keepalive, because we set a deadline on the
-		// underlying connection.
-		DisableKeepAlives: true,
-		Dial: func(netw, addr string) (c net.Conn, err error) {
-			start := time.Now()
-
-			c, err = net.DialTimeout(netw, addr, timeout)
-			if err != nil {
-				return nil, err
-			}
-
-			if err = c.SetDeadline(start.Add(timeout)); err != nil {
-				c.Close()
-				return nil, err
-			}
-
-			return c, nil
-		},
+// NewClientFromConfig returns a new HTTP client configured for the
+// given config.HTTPClientConfig.
+func NewClientFromConfig(cfg config.HTTPClientConfig) (*http.Client, error) {
+	tlsConfig, err := NewTLSConfig(cfg.TLSConfig)
+	if err != nil {
+		return nil, err
 	}
+	disableKeepAlives := true // hard-coded default unless overridden in config
+	if cfg.KeepAlive != nil {
+		disableKeepAlives = !*cfg.KeepAlive
+	}
+	// The only timeout we care about is the configured scrape timeout.
+	// It is applied on request. So we leave out any timings here.
+	var rt http.RoundTripper = &http.Transport{
+		Proxy:             http.ProxyURL(cfg.ProxyURL.URL),
+		DisableKeepAlives: disableKeepAlives,
+		TLSClientConfig:   tlsConfig,
+	}
+
+	// If a bearer token is provided, create a round tripper that will set the
+	// Authorization header correctly on each request.
+	bearerToken := string(cfg.BearerToken)
+	if len(bearerToken) == 0 && len(cfg.BearerTokenFile) > 0 {
+		b, err := ioutil.ReadFile(cfg.BearerTokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read bearer token file %s: %s", cfg.BearerTokenFile, err)
+		}
+		bearerToken = strings.TrimSpace(string(b))
+	}
+
+	if len(bearerToken) > 0 {
+		rt = NewBearerAuthRoundTripper(bearerToken, rt)
+	}
+
+	if cfg.BasicAuth != nil {
+		rt = NewBasicAuthRoundTripper(cfg.BasicAuth.Username, string(cfg.BasicAuth.Password), rt)
+	}
+
+	// Return a new client with the configured round tripper.
+	return NewClient(rt), nil
 }
 
 type bearerAuthRoundTripper struct {
@@ -119,6 +126,7 @@ func cloneRequest(r *http.Request) *http.Request {
 	return r2
 }
 
+// NewTLSConfig creates a new tls.Config from the given config.TLSConfig.
 func NewTLSConfig(cfg config.TLSConfig) (*tls.Config, error) {
 	tlsConfig := &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify}
 

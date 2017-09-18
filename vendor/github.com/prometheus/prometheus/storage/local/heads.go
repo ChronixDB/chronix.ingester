@@ -126,6 +126,9 @@ func (hs *headsScanner) scan() bool {
 	if hs.version != headsFormatLegacyVersion {
 		// persistWatermark only present in v2.
 		persistWatermark, hs.err = binary.ReadVarint(hs.r)
+		if persistWatermark < 0 {
+			hs.err = fmt.Errorf("found negative persist watermark in checkpoint: %d", persistWatermark)
+		}
 		if hs.err != nil {
 			return false
 		}
@@ -147,6 +150,11 @@ func (hs *headsScanner) scan() bool {
 	if numChunkDescs, hs.err = binary.ReadVarint(hs.r); hs.err != nil {
 		return false
 	}
+	if numChunkDescs < 0 {
+		hs.err = fmt.Errorf("found negative number of chunk descriptors in checkpoint: %d", numChunkDescs)
+		return false
+	}
+
 	chunkDescs := make([]*chunk.Desc, numChunkDescs)
 	if hs.version == headsFormatLegacyVersion {
 		if headChunkPersisted {
@@ -188,7 +196,9 @@ func (hs *headsScanner) scan() bool {
 				// This is NOT the head chunk. So it's a chunk
 				// to be persisted, and we need to populate lastTime.
 				hs.chunksToPersistTotal++
-				cd.MaybePopulateLastTime()
+				if hs.err = cd.MaybePopulateLastTime(); hs.err != nil {
+					return false
+				}
 			}
 			chunkDescs[i] = cd
 		}

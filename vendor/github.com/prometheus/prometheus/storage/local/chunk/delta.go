@@ -75,7 +75,7 @@ func newDeltaEncodedChunk(tb, vb deltaBytes, isInt bool, length int) *deltaEncod
 // Add implements chunk.
 func (c deltaEncodedChunk) Add(s model.SamplePair) ([]Chunk, error) {
 	// TODO(beorn7): Since we return &c, this method might cause an unnecessary allocation.
-	if c.len() == 0 {
+	if c.Len() == 0 {
 		c = c[:deltaHeaderBytes]
 		binary.LittleEndian.PutUint64(c[deltaHeaderBaseTimeOffset:], uint64(s.Timestamp))
 		binary.LittleEndian.PutUint64(c[deltaHeaderBaseValueOffset:], math.Float64bits(float64(s.Value)))
@@ -191,7 +191,7 @@ func (c deltaEncodedChunk) FirstTime() model.Time {
 
 // NewIterator implements chunk.
 func (c *deltaEncodedChunk) NewIterator() Iterator {
-	return newIndexAccessingChunkIterator(c.len(), &deltaEncodedIndexAccessor{
+	return newIndexAccessingChunkIterator(c.Len(), &deltaEncodedIndexAccessor{
 		c:      *c,
 		baseT:  c.baseTime(),
 		baseV:  c.baseValue(),
@@ -238,27 +238,36 @@ func (c *deltaEncodedChunk) Unmarshal(r io.Reader) error {
 	if _, err := io.ReadFull(r, *c); err != nil {
 		return err
 	}
-	l := binary.LittleEndian.Uint16((*c)[deltaHeaderBufLenOffset:])
-	if int(l) > cap(*c) {
-		return fmt.Errorf("chunk length exceeded during unmarshaling: %d", l)
-	}
-	if int(l) < deltaHeaderBytes {
-		return fmt.Errorf("chunk length less than header size: %d < %d", l, deltaHeaderBytes)
-	}
-	*c = (*c)[:l]
-	return nil
+	return c.setLen()
 }
 
 // UnmarshalFromBuf implements chunk.
 func (c *deltaEncodedChunk) UnmarshalFromBuf(buf []byte) error {
 	*c = (*c)[:cap(*c)]
 	copy(*c, buf)
+	return c.setLen()
+}
+
+// setLen sets the length of the underlying slice and performs some sanity checks.
+func (c *deltaEncodedChunk) setLen() error {
 	l := binary.LittleEndian.Uint16((*c)[deltaHeaderBufLenOffset:])
 	if int(l) > cap(*c) {
-		return fmt.Errorf("chunk length exceeded during unmarshaling: %d", l)
+		return fmt.Errorf("delta chunk length exceeded during unmarshaling: %d", l)
 	}
 	if int(l) < deltaHeaderBytes {
-		return fmt.Errorf("chunk length less than header size: %d < %d", l, deltaHeaderBytes)
+		return fmt.Errorf("delta chunk length less than header size: %d < %d", l, deltaHeaderBytes)
+	}
+	switch c.timeBytes() {
+	case d1, d2, d4, d8:
+		// Pass.
+	default:
+		return fmt.Errorf("invalid number of time bytes in delta chunk: %d", c.timeBytes())
+	}
+	switch c.valueBytes() {
+	case d0, d1, d2, d4, d8:
+		// Pass.
+	default:
+		return fmt.Errorf("invalid number of value bytes in delta chunk: %d", c.valueBytes())
 	}
 	*c = (*c)[:l]
 	return nil
@@ -296,7 +305,8 @@ func (c deltaEncodedChunk) sampleSize() int {
 	return int(c.timeBytes() + c.valueBytes())
 }
 
-func (c deltaEncodedChunk) len() int {
+// Len implements Chunk. Runs in constant time.
+func (c deltaEncodedChunk) Len() int {
 	if len(c) < deltaHeaderBytes {
 		return 0
 	}

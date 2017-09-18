@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -12,6 +15,8 @@ import (
 	"github.com/ChronixDB/chronix.go/chronix"
 	"github.com/ChronixDB/chronix.ingester/ingester"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/storage/remote"
 )
 
 type erroringChronix struct{}
@@ -127,22 +132,34 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	mux := http.NewServeMux()
+	serv := httptest.NewServer(mux)
+	defer serv.Close()
+
+	mux.Handle("/", ingestHandler(ing))
+
+	u, err := url.Parse(serv.URL)
+	if err != nil {
+		panic(err)
+	}
+	ingClient, err := remote.NewClient(0, &remote.ClientConfig{
+		URL:     &config.URL{URL: u},
+		Timeout: model.Duration(time.Second),
+	})
+
 	// Create test samples.
 	testData := buildTestMatrix(10, 1000)
 
 	// Shove test samples into the ingester.
-	for _, s := range matrixToSamples(testData) {
-		err := ing.Append(s)
-		if err != nil {
-			t.Fatal(err)
-		}
+	if err := ingClient.Store(matrixToSamples(testData)); err != nil {
+		t.Fatal(err)
 	}
 
 	// Stop the ingester, causing it to checkpoint its state to disk.
 	ing.Stop()
 
 	// Create a new ingester that recovers from the checkpoint, but tries
-	// to store chunks into a an erroring Chronix client.
+	// to store chunks into an erroring Chronix client.
 	ing, err = ingester.NewIngester(
 		ingester.Config{
 			MaxChunkAge:     9999 * time.Hour,

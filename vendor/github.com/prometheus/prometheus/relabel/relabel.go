@@ -26,17 +26,15 @@ import (
 // Process returns a relabeled copy of the given label set. The relabel configurations
 // are applied in order of input.
 // If a label set is dropped, nil is returned.
+// May return the input labelSet modified.
 func Process(labels model.LabelSet, cfgs ...*config.RelabelConfig) model.LabelSet {
-	out := model.LabelSet{}
-	for ln, lv := range labels {
-		out[ln] = lv
-	}
 	for _, cfg := range cfgs {
-		if out = relabel(out, cfg); out == nil {
+		labels = relabel(labels, cfg)
+		if labels == nil {
 			return nil
 		}
 	}
-	return out
+	return labels
 }
 
 func relabel(labels model.LabelSet, cfg *config.RelabelConfig) model.LabelSet {
@@ -61,15 +59,20 @@ func relabel(labels model.LabelSet, cfg *config.RelabelConfig) model.LabelSet {
 		if indexes == nil {
 			break
 		}
+		target := model.LabelName(cfg.Regex.ExpandString([]byte{}, cfg.TargetLabel, val, indexes))
+		if !target.IsValid() {
+			delete(labels, model.LabelName(cfg.TargetLabel))
+			break
+		}
 		res := cfg.Regex.ExpandString([]byte{}, cfg.Replacement, val, indexes)
 		if len(res) == 0 {
-			delete(labels, cfg.TargetLabel)
-		} else {
-			labels[cfg.TargetLabel] = model.LabelValue(res)
+			delete(labels, model.LabelName(cfg.TargetLabel))
+			break
 		}
+		labels[target] = model.LabelValue(res)
 	case config.RelabelHashMod:
 		mod := sum64(md5.Sum([]byte(val))) % cfg.Modulus
-		labels[cfg.TargetLabel] = model.LabelValue(fmt.Sprintf("%d", mod))
+		labels[model.LabelName(cfg.TargetLabel)] = model.LabelValue(fmt.Sprintf("%d", mod))
 	case config.RelabelLabelMap:
 		out := make(model.LabelSet, len(labels))
 		// Take a copy to avoid infinite loops.
@@ -83,6 +86,18 @@ func relabel(labels model.LabelSet, cfg *config.RelabelConfig) model.LabelSet {
 			}
 		}
 		labels = out
+	case config.RelabelLabelDrop:
+		for ln := range labels {
+			if cfg.Regex.MatchString(string(ln)) {
+				delete(labels, ln)
+			}
+		}
+	case config.RelabelLabelKeep:
+		for ln := range labels {
+			if !cfg.Regex.MatchString(string(ln)) {
+				delete(labels, ln)
+			}
+		}
 	default:
 		panic(fmt.Errorf("retrieval.relabel: unknown relabel action type %q", cfg.Action))
 	}
