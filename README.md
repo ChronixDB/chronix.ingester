@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/ChronixDB/chronix.ingester.svg?branch=master)](https://travis-ci.org/ChronixDB/chronix.ingester)
+
 # chronix.ingester
 
 The Chronix Ingester batches up sample data from various sources and
