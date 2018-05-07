@@ -42,7 +42,7 @@ func (c *testChronix) Store(ts []*chronix.TimeSeries, commit bool, commitWithin 
 
 	for _, s := range ts {
 		m := model.Metric{
-			model.MetricNameLabel: model.LabelValue(s.Metric),
+			model.MetricNameLabel: model.LabelValue(s.Name),
 		}
 		for k, v := range s.Attributes {
 			m[model.LabelName(k)] = model.LabelValue(v)

@@ -2,7 +2,8 @@ package chronix
 
 // A TimeSeries models a Chronix time series chunk.
 type TimeSeries struct {
-	Metric     string
+	Name     string
+	Type       string
 	Attributes map[string]string
 	Points     []Point
 }

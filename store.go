@@ -29,7 +29,8 @@ func (s *chronixStore) Put(metric model.Metric, descs []*chunk.Desc) error {
 
 func transcodeChunk(metric model.Metric, desc *chunk.Desc) (*chronix.TimeSeries, error) {
 	ts := &chronix.TimeSeries{
-		Metric:     string(metric[model.MetricNameLabel]),
+		Name:       string(metric[model.MetricNameLabel]),
+		Type:       "metric",
 		Attributes: map[string]string{},
 	}
 	for k, v := range metric {

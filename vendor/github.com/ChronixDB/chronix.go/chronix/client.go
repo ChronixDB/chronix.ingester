@@ -1,9 +1,9 @@
 package chronix
 
 import (
+	"time"
 	"encoding/base64"
 	"fmt"
-	"time"
 )
 
 // Client is a client that allows storing time series in Chronix.
@@ -14,13 +14,13 @@ type Client interface {
 }
 
 type client struct {
-	solr SolrClient
+	storage StorageClient
 }
 
 // New creates a new Chronix client.
-func New(s SolrClient) Client {
+func New(s StorageClient) Client {
 	return &client{
-		solr: s,
+		storage: s,
 	}
 }
 
@@ -29,7 +29,7 @@ func (c *client) Store(series []*TimeSeries, commit bool, commitWithin time.Dura
 		return nil
 	}
 
-	update := []map[string]interface{}{}
+	var update []map[string]interface{}
 	for _, ts := range series {
 		if len(ts.Points) == 0 {
 			continue
@@ -41,21 +41,28 @@ func (c *client) Store(series []*TimeSeries, commit bool, commitWithin time.Dura
 		}
 		encData := base64.StdEncoding.EncodeToString(data)
 		fields := map[string]interface{}{
-			"start":  ts.Points[0].Timestamp,
-			"end":    ts.Points[len(ts.Points)-1].Timestamp,
-			"data":   encData,
-			"metric": ts.Metric,
+			"start": ts.Points[0].Timestamp,
+			"end":   ts.Points[len(ts.Points)-1].Timestamp,
+			"data":  encData,
+			"name":  ts.Name,
+			"type":  ts.Type,
 		}
 
-		for k, v := range ts.Attributes {
-			fields[k+"_s"] = v
+		if c.storage.NeedPostfixOnDynamicField() {
+			for k, v := range ts.Attributes {
+				fields[k+"_s"] = v
+			}
+		} else {
+			for k, v := range ts.Attributes {
+				fields[k] = v
+			}
 		}
 
 		update = append(update, fields)
 	}
-	return c.solr.Update(update, commit, commitWithin)
+	return c.storage.Update(update, commit, commitWithin)
 }
 
 func (c *client) Query(q, fq, fl string) ([]byte, error) {
-	return c.solr.Query(q, fq, fl)
+	return c.storage.Query(q, fq, fl)
 }

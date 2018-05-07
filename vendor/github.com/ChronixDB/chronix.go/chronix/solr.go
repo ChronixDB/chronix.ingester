@@ -12,13 +12,6 @@ import (
 	"time"
 )
 
-// A SolrClient allows updating documents in Solr.
-type SolrClient interface {
-	Update(data []map[string]interface{}, commit bool, commitWithin time.Duration) error
-	// TODO: Return a more interpreted result on the Solr level.
-	Query(q, fq, fl string) ([]byte, error)
-}
-
 // CancelableTransport is like net.Transport but provides
 // per-request cancelation functionality.
 type CancelableTransport interface {
@@ -41,8 +34,8 @@ type solrClient struct {
 	httpClient http.Client
 }
 
-// NewSolrClient creates a new Solr client.
-func NewSolrClient(url *url.URL, transport CancelableTransport) SolrClient {
+// NewSolrStorage creates a new Solr client.
+func NewSolrStorage(url *url.URL, transport CancelableTransport) StorageClient {
 	if transport == nil {
 		transport = DefaultTransport
 	}
@@ -88,12 +81,12 @@ func (c *solrClient) Update(data []map[string]interface{}, commit bool, commitWi
 	return nil
 }
 
-func (c *solrClient) Query(q, fq, fl string) ([]byte, error) {
+func (c *solrClient) Query(q, cj, fl string) ([]byte, error) {
 	u := *c.url
 	u.Path = path.Join(c.url.Path, "/select")
 	qs := u.Query()
 	qs.Set("q", q)
-	qs.Set("fq", fq)
+	qs.Set("cj", cj)
 	qs.Set("fl", fl)
 	qs.Set("wt", "json")
 	u.RawQuery = qs.Encode()
@@ -112,4 +105,8 @@ func (c *solrClient) Query(q, fq, fl string) ([]byte, error) {
 		return nil, fmt.Errorf("error reading response body: %v", err)
 	}
 	return body, nil
+}
+
+func (c *solrClient) NeedPostfixOnDynamicField() bool {
+	return true
 }
