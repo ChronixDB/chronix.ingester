@@ -59,6 +59,13 @@ Usage of ./chronix.ingester:
 
 ```
 
+## Run in Docker container
+A docker image is provided on [Docker Hub](https://hub.docker.com/r/chronix/chronix.ingester/).
+The Dockerfile defines the entrypoint to the chronix.ingester binary but no program arguments. You have to
+set the commands yourself, e.g.:
+
+`docker run --rm -it chronix/chronix.ingester -url=http://localhost:9200 -kind=elastic -es.deleteIndexIfExists=true`
+
 ## Testing
 
 To run tests:
