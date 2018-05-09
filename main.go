@@ -22,6 +22,7 @@ func main() {
 		kind                  = flag.String("kind", "solr", "Possible values are: 'solr' or 'elastic'")
 		esWithIndex           = flag.Bool("es.withIndex", true, "Creates an index (only used with elastic search")
 		esDeleteIndexIfExists = flag.Bool("es.deleteIndexIfExists", false, "Deletes the index only with es.withIndex=true")
+		esSniffNodes          = flag.Bool("es.sniffNodes", true, "Should elastic client sniff for ES nodes (only used with elastic search)")
 		commitWithin          = flag.Duration("chronix-commit-within", 5*time.Second, "The duration after which updates to Chronix should be committed.")
 		maxChunkAge           = flag.Duration("max-chunk-age", time.Hour, "The maximum age of a chunk before it is closed and persisted.")
 		checkpointFile        = flag.String("checkpoint-file", "checkpoint.db", "The path to the checkpoint file.")
@@ -40,7 +41,7 @@ func main() {
 		client = chronix.New(chronix.NewSolrStorage(u, nil))
 	} else if *kind == "elastic" {
 
-		client = chronix.New(chronix.NewElasticStorage(storageUrl, esWithIndex, esDeleteIndexIfExists))
+		client = chronix.New(chronix.NewElasticStorage(storageUrl, esWithIndex, esDeleteIndexIfExists, esSniffNodes))
 	} else {
 		log.Fatalln("Kind parameter unknown:", *kind)
 	}

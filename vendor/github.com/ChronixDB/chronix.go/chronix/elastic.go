@@ -26,10 +26,15 @@ func NewElasticTestStorage(url *string) StorageClient {
 	}
 }
 
-// NewSolrStorage creates a new Solr client.
-func NewElasticStorage(url *string, withIndex *bool, deleteIfExists *bool) StorageClient {
+// NewElasticStorage creates a new Elastic client.
+func NewElasticStorage(url *string, withIndex *bool, deleteIfExists *bool, sniffElasticNodes *bool) StorageClient {
 
-	client, err := elastic.NewClient(elastic.SetURL(*url))
+	sniff := true
+	if sniffElasticNodes != nil {
+		sniff = *sniffElasticNodes
+	}
+
+	client, err := elastic.NewClient(elastic.SetURL(*url), elastic.SetSniff(sniff))
 	if err != nil {
 		log.Fatal(fmt.Errorf("error creating elasticserach client: %v", err))
 		return nil

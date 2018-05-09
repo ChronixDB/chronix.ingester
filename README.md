@@ -22,7 +22,7 @@ go build
 Example:
 
 ```
-./chronix.ingester -chronix-url=http://my-solr-host:8983/solr/chronix -max-chunk-age=30m
+./chronix.ingester -url=http://my-solr-host:8983/solr/chronix -max-chunk-age=30m
 ```
 
 To show all flags:
@@ -31,23 +31,32 @@ To show all flags:
 ./chronix.ingester -h
 Usage of ./chronix.ingester:
   -checkpoint-file string
-    	The path to the checkpoint file. (default "checkpoint.db")
+        The path to the checkpoint file. (default "checkpoint.db")
   -checkpoint-interval duration
-    	The interval between checkpoints. (default 5m0s)
+        The interval between checkpoints. (default 5m0s)
   -chronix-commit-within duration
-    	The duration after which updates to Chronix should be committed. (default 5s)
-  -chronix-url string
-    	The URL of the Chronix endpoint. (default "http://localhost:8983/solr/chronix")
+        The duration after which updates to Chronix should be committed. (default 5s)
+  -es.deleteIndexIfExists
+        Deletes the index only with es.withIndex=true
+  -es.sniffNodes
+        Should elastic client sniff for ES nodes (only used with elastic search) (default true)
+  -es.withIndex
+        Creates an index (only used with elastic search (default true)
   -flush-on-shutdown
-    	Whether to flush all chunks to Chronix on shutdown, rather than saving them to a checkpoint. A checkpoint will still be written, but will be empty.
+        Whether to flush all chunks to Chronix on shutdown, rather than saving them to a checkpoint. A checkpoint will still be written, but will be empty.
+  -kind string
+        Possible values are: 'solr' or 'elastic' (default "solr")
   -listen-addr string
-    	The address to listen on. (default ":8080")
+        The address to listen on. (default ":8080")
   -log.format value
-    	Set the log target and format. Example: "logger:syslog?appname=bob&local=7" or "logger:stdout?json=true" (default "logger:stderr")
+        Set the log target and format. Example: "logger:syslog?appname=bob&local=7" or "logger:stdout?json=true" (default "logger:stderr")
   -log.level value
-    	Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal] (default "info")
+        Only log messages with the given severity or above. Valid levels: [debug, info, warn, error, fatal] (default "info")
   -max-chunk-age duration
-    	The maximum age of a chunk before it is closed and persisted. (default 1h0m0s)
+        The maximum age of a chunk before it is closed and persisted. (default 1h0m0s)
+  -url string
+        The URL of the Chronix endpoint. (default "http://localhost:8983/solr/chronix")
+
 ```
 
 ## Testing
