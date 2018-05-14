@@ -56,10 +56,15 @@ func configureIndex(client *elastic.Client, deleteIfExists *bool) {
 		log.Fatal(fmt.Errorf("error checking if index 'chronix' exists: %v", err))
 	}
 
-	//if the index exists and we should delete the index
-	if exists && *deleteIfExists {
-		log.Info("Delete index and create a new one")
-		client.DeleteIndex("chronix").Do(context.Background())
+	//if the index does not exist or we should delete the index
+	if !exists || *deleteIfExists {
+
+		if *deleteIfExists {
+			log.Info("Delete index")
+			client.DeleteIndex("chronix").Do(context.Background())
+		}
+
+		log.Info("Create new index")
 
 		mapping :=
 			`{"settings":{"number_of_shards":1,"number_of_replicas":0}, "mappings":{	"doc":{
@@ -108,7 +113,7 @@ func (c *elasticClient) Update(data []map[string]interface{}, commit bool, commi
 }
 
 func (c *elasticClient) Query(q, cj, fl string) ([]byte, error) {
-	return nil, fmt.Errorf("not yet implmented")
+	return nil, fmt.Errorf("not yet implemented")
 }
 
 func (c *elasticClient) NeedPostfixOnDynamicField() bool {

@@ -29,13 +29,15 @@ To show all flags:
 
 ```
 ./chronix.ingester -h
-Usage of ./chronix.ingester:
+Usage of chronix.ingester.exe:
   -checkpoint-file string
         The path to the checkpoint file. (default "checkpoint.db")
   -checkpoint-interval duration
         The interval between checkpoints. (default 5m0s)
   -chronix-commit-within duration
         The duration after which updates to Chronix should be committed. (default 5s)
+  -create-statistics
+        Whether to store some additional statistical data for each data chunk.
   -es.deleteIndexIfExists
         Deletes the index only with es.withIndex=true
   -es.sniffNodes

@@ -28,22 +28,30 @@ func main() {
 		checkpointFile        = flag.String("checkpoint-file", "checkpoint.db", "The path to the checkpoint file.")
 		checkpointInterval    = flag.Duration("checkpoint-interval", 5*time.Minute, "The interval between checkpoints.")
 		flushOnShutdown       = flag.Bool("flush-on-shutdown", false, "Whether to flush all chunks to Chronix on shutdown, rather than saving them to a checkpoint. A checkpoint will still be written, but will be empty.")
+		createStatistics      = flag.Bool("create-statistics", false, "Whether to store some additional statistical data for each data chunk.")
 	)
 	flag.Parse()
 
-	var client chronix.Client;
+	var storageClient chronix.StorageClient
 	if *kind == "solr" {
 
 		u, err := url.Parse(*storageUrl)
 		if err != nil {
 			log.Fatalln("Failed to parse Chronix URL:", err)
 		}
-		client = chronix.New(chronix.NewSolrStorage(u, nil))
+		storageClient = chronix.NewSolrStorage(u, nil)
 	} else if *kind == "elastic" {
 
-		client = chronix.New(chronix.NewElasticStorage(storageUrl, esWithIndex, esDeleteIndexIfExists, esSniffNodes))
+		storageClient = chronix.NewElasticStorage(storageUrl, esWithIndex, esDeleteIndexIfExists, esSniffNodes)
 	} else {
 		log.Fatalln("Kind parameter unknown:", *kind)
+	}
+
+	var client chronix.Client
+	if *createStatistics {
+		client = chronix.NewWithStatistics(storageClient)
+	} else {
+		client = chronix.New(storageClient)
 	}
 
 	ing, err := ingester.NewIngester(
