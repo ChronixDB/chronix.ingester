@@ -2,6 +2,7 @@ package chronix
 
 import (
 	"errors"
+	"math/big"
 )
 
 type stats struct {
@@ -26,7 +27,7 @@ func calculateStats(timeSeries *TimeSeries) (stats, error) {
 	result.min = (*points)[0].Value
 	result.max = (*points)[0].Value
 
-	var sum float64 = 0
+	var sum = big.NewFloat(0)
 
 	for _, point := range *points {
 		if point.Value > result.max {
@@ -34,10 +35,10 @@ func calculateStats(timeSeries *TimeSeries) (stats, error) {
 		} else if point.Value < result.min {
 			result.min = point.Value
 		}
-		sum += point.Value
+		sum.Add(sum, big.NewFloat(point.Value))
 	}
 
-	result.avg = sum / float64(result.count)
+	result.avg, _ = sum.Quo(sum, big.NewFloat(float64(result.count))).Float64()
 	result.timespan = (*points)[len(*points) - 1].Timestamp - (*points)[0].Timestamp
 
 	return result, nil
