@@ -3,6 +3,7 @@ package chronix
 import (
 	"errors"
 	"math/big"
+	"math"
 )
 
 type stats struct {
@@ -28,17 +29,23 @@ func calculateStats(timeSeries *TimeSeries) (stats, error) {
 	result.max = (*points)[0].Value
 
 	var sum = big.NewFloat(0)
+	var number int64 = 0
 
 	for _, point := range *points {
+		if math.IsNaN(point.Value) {
+			continue
+		}
 		if point.Value > result.max {
 			result.max = point.Value
 		} else if point.Value < result.min {
 			result.min = point.Value
 		}
+
+		number++
 		sum.Add(sum, big.NewFloat(point.Value))
 	}
 
-	result.avg, _ = sum.Quo(sum, big.NewFloat(float64(result.count))).Float64()
+	result.avg, _ = sum.Quo(sum, big.NewFloat(float64(number))).Float64()
 	result.timespan = (*points)[len(*points) - 1].Timestamp - (*points)[0].Timestamp
 
 	return result, nil
